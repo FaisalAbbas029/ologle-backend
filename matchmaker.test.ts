@@ -11,7 +11,7 @@ import {
   type QueuedSession,
 } from './matchmaker.ts';
 import { defaultSafetyAgent } from './safetyAgent.ts';
-import { validateProfession } from '../client/src/data/constants.ts';
+import { validateProfession } from './src/validation/index.ts';
 
 function makeQueuedSession(overrides: Partial<QueuedSession> = {}): QueuedSession {
   return {

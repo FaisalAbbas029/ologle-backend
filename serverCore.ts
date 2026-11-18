@@ -9,8 +9,8 @@ import { WebSocket } from 'ws';
 import { defaultSafetyAgent, type SafetyClassificationResult } from './safetyAgent.ts';
 import { MatchmakerQueue, calculateCompatibility } from './matchmaker.ts';
 import type { QueuedSession, MatchScoreResult } from './matchmaker.ts';
-import { validateProfession } from '../client/src/data/constants.ts';
-import type { ScoreBreakdown, EphemeralLiveTicket } from '../client/src/types/index.ts';
+import { validateProfession } from './src/validation/index.ts';
+import type { ScoreBreakdown, EphemeralLiveTicket } from './src/types/index.ts';
 
 /**
  * Transient volatile in-memory cache with automated TTL purge.
@@ -820,7 +820,7 @@ export class OlogleEngine {
     if (sessionB.ws) this.send(sessionB.ws, payloadB);
   }
 
-  private handlePadUpdate(session: EphemeralSession, content: string, language: string): void {
+  private handlePadUpdate(session: EphemeralSession, content: string, language?: string): void {
     if (session.currentMode === '1on1' && session.pairedSessionId) {
       const partner = this.sessions.get(session.pairedSessionId);
       if (partner && partner.ws) {

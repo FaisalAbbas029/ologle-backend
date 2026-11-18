@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: ologle-backend
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3000"
+      - key: ALLOWED_ORIGINS
+        value: https://ologle.vercel.app,https://ologle.network,https://www.ologle.network
+      - key: RENDER
+        value: "true"
+      - key: TURN_URLS
+        sync: false
+      - key: TURN_SHARED_SECRET
+        sync: false
+      - key: TURN_CREDENTIAL_TTL_SECONDS
+        value: "600"
+      - key: GEMINI_API_KEY
+        sync: false

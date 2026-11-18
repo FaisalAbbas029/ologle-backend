@@ -34,7 +34,7 @@ export async function generateAIPracticeReply(input: {
     throw new Error('AI practice is not configured. Add GEMINI_API_KEY to the server environment.');
   }
 
-  const { AI_PRACTICE_PARTNERS } = await import('../client/src/data/aiPracticePartners.ts');
+  const { AI_PRACTICE_PARTNERS } = await import('./src/data/aiPartners.ts');
   const partner = AI_PRACTICE_PARTNERS.find((p) => p.id === input.partnerId) || AI_PRACTICE_PARTNERS[0];
 
   const history = input.messages
