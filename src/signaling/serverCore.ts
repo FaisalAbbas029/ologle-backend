@@ -176,6 +176,7 @@ export type ServerMessage =
       partnerProfession?: string;
       partnerCountry?: string;
       partnerVisitorId?: string;
+      partnerSessionId?: string;
       scoreBreakdown?: ScoreBreakdown;
       isInitiator?: boolean;
     }
@@ -538,6 +539,22 @@ export class OlogleEngine {
 
     this.send(ws, { type: 'SESSION_REGISTERED', sessionId });
     distributedState.subscribeToSession(sessionId, (msg) => {
+      try {
+        const parsed = JSON.parse(msg);
+        if (parsed.type === 'MATCH_FOUND') {
+          session.currentMode = '1on1';
+          session.pairedSessionId = parsed.partnerSessionId || null;
+          session.currentRoomId = parsed.roomId || null;
+          this.matchQueue.remove(session.sessionId);
+        } else if (parsed.type === 'PARTNER_LEFT') {
+          if (session.currentMode === '1on1') {
+            session.currentMode = 'none';
+            session.pairedSessionId = null;
+            session.currentRoomId = null;
+          }
+        }
+      } catch {}
+
       if (session.ws && session.ws.readyState === WebSocket.OPEN) {
         session.ws.send(msg);
       }
@@ -936,7 +953,77 @@ export class OlogleEngine {
         sessionMode: session.sessionMode,
         timestamp: Date.now(),
       });
+
+      // If distributed clustering is active, attempt cross-instance match
+      if (distributedState.isDistributed()) {
+        this.tryMatchFromSharedQueue(session, queuedSession);
+      }
     }
+  }
+
+  private async tryMatchFromSharedQueue(session: EphemeralSession, queuedSession: QueuedSession): Promise<boolean> {
+    if (!distributedState.isDistributed()) return false;
+    try {
+      const mode = session.sessionMode || 'default';
+      const tickets = await distributedState.getSharedQueueTickets(mode);
+      if (!tickets || tickets.length === 0) return false;
+
+      const candidates = tickets.filter((t) => {
+        if (t.sessionId === session.sessionId) return false;
+        if (session.blockedSessionIds?.has(t.sessionId)) return false;
+        if (t.visitorId && session.blockedVisitorIds?.has(t.visitorId)) return false;
+        const local = this.sessions.get(t.sessionId);
+        if (local && local.currentMode !== 'matching') return false;
+        return true;
+      });
+
+      if (candidates.length === 0) return false;
+
+      let bestCandidate: (typeof candidates)[0] | null = null;
+      let bestScoreResult: MatchScoreResult | null = null;
+
+      for (const candidate of candidates) {
+        const candidateQueued: QueuedSession = {
+          sessionId: candidate.sessionId,
+          visitorId: candidate.visitorId,
+          profession: candidate.profession || 'Undisclosed',
+          interests: candidate.interests || [],
+          country: candidate.country || 'GLOBAL',
+          mode: candidate.sessionMode || 'video',
+          queuedAt: candidate.timestamp || Date.now(),
+          blockedSessionIds: new Set(),
+          matchedSessionId: null,
+        };
+
+        const scoreResult = calculateCompatibility(queuedSession, candidateQueued);
+        if (!bestScoreResult || scoreResult.score > bestScoreResult.score) {
+          bestScoreResult = scoreResult;
+          bestCandidate = candidate;
+        }
+      }
+
+      if (bestCandidate && bestScoreResult) {
+        const claimed = await distributedState.claimQueueTicket(bestCandidate.sessionId, mode);
+        if (claimed) {
+          const candidateQueued: QueuedSession = {
+            sessionId: bestCandidate.sessionId,
+            visitorId: bestCandidate.visitorId,
+            profession: bestCandidate.profession || 'Undisclosed',
+            interests: bestCandidate.interests || [],
+            country: bestCandidate.country || 'GLOBAL',
+            mode: bestCandidate.sessionMode || 'video',
+            queuedAt: bestCandidate.timestamp || Date.now(),
+            blockedSessionIds: new Set(),
+            matchedSessionId: null,
+          };
+          this.pairSessions(session, candidateQueued, bestScoreResult);
+          return true;
+        }
+      }
+    } catch (err: any) {
+      console.warn('[OLOGLE Matchmaker] Shared queue matching error:', err.message);
+    }
+    return false;
   }
 
   private cancelMatching(session: EphemeralSession): void {
@@ -952,41 +1039,55 @@ export class OlogleEngine {
 
   private pairSessions(sessionA: EphemeralSession, candidateB: QueuedSession, scoreResult: MatchScoreResult): void {
     const sessionB = this.sessions.get(candidateB.sessionId);
-    // Strict atomic verification to avoid race conditions:
-    if (!sessionB || !sessionB.ws || sessionB.currentMode !== 'matching') {
-      this.matchQueue.remove(candidateB.sessionId);
-      // Re-enqueue sessionA if candidate is gone or no longer matching
-      const queuedA: QueuedSession = {
-        sessionId: sessionA.sessionId,
-        visitorId: sessionA.visitorId,
-        ipAddress: sessionA.ipAddress,
-        isLoopback: sessionA.isLoopback,
-        profession: sessionA.profession,
-        interests: sessionA.interests,
-        country: sessionA.country || 'GLOBAL',
-        queuedAt: Date.now(),
-        blockedSessionIds: sessionA.blockedSessionIds,
-        matchedSessionId: null,
-      };
-      this.matchQueue.enqueue(queuedA);
-      return;
+    const isRemoteB = !sessionB;
+
+    if (isRemoteB) {
+      if (!distributedState.isDistributed()) {
+        this.matchQueue.remove(candidateB.sessionId);
+        return;
+      }
+    } else {
+      // Local atomic verification to avoid race conditions
+      if (!sessionB.ws || sessionB.currentMode !== 'matching') {
+        this.matchQueue.remove(candidateB.sessionId);
+        // Re-enqueue sessionA if candidate is gone or no longer matching
+        const queuedA: QueuedSession = {
+          sessionId: sessionA.sessionId,
+          visitorId: sessionA.visitorId,
+          ipAddress: sessionA.ipAddress,
+          isLoopback: sessionA.isLoopback,
+          profession: sessionA.profession,
+          interests: sessionA.interests,
+          country: sessionA.country || 'GLOBAL',
+          queuedAt: Date.now(),
+          blockedSessionIds: sessionA.blockedSessionIds,
+          matchedSessionId: null,
+        };
+        this.matchQueue.enqueue(queuedA);
+        return;
+      }
     }
 
     const roomId = `room_1on1_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
     sessionA.currentMode = '1on1';
-    sessionA.pairedSessionId = sessionB.sessionId;
+    sessionA.pairedSessionId = candidateB.sessionId;
     sessionA.currentRoomId = roomId;
+    this.matchQueue.remove(sessionA.sessionId);
 
-    sessionB.currentMode = '1on1';
-    sessionB.pairedSessionId = sessionA.sessionId;
-    sessionB.currentRoomId = roomId;
+    if (sessionB) {
+      sessionB.currentMode = '1on1';
+      sessionB.pairedSessionId = sessionA.sessionId;
+      sessionB.currentRoomId = roomId;
+      this.matchQueue.remove(sessionB.sessionId);
+    }
 
     distributedState.removeQueueTicket(sessionA.sessionId, sessionA.sessionMode || 'default');
     distributedState.removeQueueTicket(candidateB.sessionId, candidateB.mode || 'default');
 
     const professionBonus = Boolean(scoreResult.isSharedProfession || scoreResult.isComplementaryProfession);
-    const countryBonus = Boolean(sessionA.country && sessionA.country !== 'GLOBAL' && sessionA.country === sessionB.country);
+    const partnerCountry = sessionB ? sessionB.country : candidateB.country;
+    const countryBonus = Boolean(sessionA.country && sessionA.country !== 'GLOBAL' && sessionA.country === partnerCountry);
 
     const scoreBreakdown = {
       sharedInterests: scoreResult.sharedInterests,
@@ -1002,9 +1103,10 @@ export class OlogleEngine {
       sharedInterests: scoreResult.sharedInterests,
       sharedTopics: scoreResult.sharedTopics,
       score: scoreResult.score,
-      partnerProfession: sessionB.profession,
-      partnerCountry: sessionB.country || 'GLOBAL',
-      partnerVisitorId: sessionB.visitorId,
+      partnerProfession: sessionB ? sessionB.profession : candidateB.profession,
+      partnerCountry: sessionB ? (sessionB.country || 'GLOBAL') : (candidateB.country || 'GLOBAL'),
+      partnerVisitorId: sessionB ? sessionB.visitorId : candidateB.visitorId,
+      partnerSessionId: candidateB.sessionId,
       scoreBreakdown,
       isInitiator: true,
     };
@@ -1018,38 +1120,37 @@ export class OlogleEngine {
       partnerProfession: sessionA.profession,
       partnerCountry: sessionA.country || 'GLOBAL',
       partnerVisitorId: sessionA.visitorId,
+      partnerSessionId: sessionA.sessionId,
       scoreBreakdown,
       isInitiator: false,
     };
 
     if (sessionA.ws) this.send(sessionA.ws, payloadA);
-    if (sessionB.ws) this.send(sessionB.ws, payloadB);
+    if (sessionB && sessionB.ws) {
+      this.send(sessionB.ws, payloadB);
+    } else {
+      this.sendToPartner(candidateB.sessionId, payloadB);
+    }
   }
 
   private handlePadUpdate(session: EphemeralSession, content: string, language?: string): void {
     if (session.currentMode === '1on1' && session.pairedSessionId) {
-      const partner = this.sessions.get(session.pairedSessionId);
-      if (partner && partner.ws) {
-        this.send(partner.ws, {
-          type: 'PAD_UPDATE',
-          content: (content || '').slice(0, 10000),
-          language: (language || 'javascript').slice(0, 50),
-          senderSessionId: session.sessionId,
-        });
-      }
+      this.sendToPartner(session.pairedSessionId, {
+        type: 'PAD_UPDATE',
+        content: (content || '').slice(0, 10000),
+        language: (language || 'javascript').slice(0, 50),
+        senderSessionId: session.sessionId,
+      });
     }
   }
 
   private handleTypingIndicator(session: EphemeralSession, isTyping: boolean): void {
     if (session.currentMode === '1on1' && session.pairedSessionId) {
-      const partner = this.sessions.get(session.pairedSessionId);
-      if (partner && partner.ws) {
-        this.send(partner.ws, {
-          type: 'TYPING_INDICATOR',
-          isTyping: Boolean(isTyping),
-          senderSessionId: session.sessionId,
-        });
-      }
+      this.sendToPartner(session.pairedSessionId, {
+        type: 'TYPING_INDICATOR',
+        isTyping: Boolean(isTyping),
+        senderSessionId: session.sessionId,
+      });
     }
   }
 
@@ -1319,18 +1420,24 @@ export class OlogleEngine {
       return;
     }
 
-    const partner = this.sessions.get(session.pairedSessionId);
     if (
-      !partner ||
-      partner.currentMode !== '1on1' ||
-      partner.pairedSessionId !== session.sessionId ||
-      partner.currentRoomId !== session.currentRoomId ||
       !signal ||
       typeof signal !== 'object' ||
       !['offer', 'answer', 'candidate'].includes(signal.type) ||
       JSON.stringify(signal).length > 128_000
     ) {
       return;
+    }
+
+    const partner = this.sessions.get(session.pairedSessionId);
+    if (partner) {
+      if (
+        partner.currentMode !== '1on1' ||
+        partner.pairedSessionId !== session.sessionId ||
+        partner.currentRoomId !== session.currentRoomId
+      ) {
+        return;
+      }
     }
 
     this.sendToPartner(session.pairedSessionId, { type: 'WEBRTC_SIGNAL', signal });
@@ -1351,18 +1458,15 @@ export class OlogleEngine {
     const clean = (text || '').trim();
     if (!clean) return;
 
-    const partner = this.sessions.get(session.pairedSessionId);
-    if (partner && partner.ws) {
-      this.send(partner.ws, {
-        type: 'VOICE_TRANSCRIPT',
-        id: id || `tr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        text: clean,
-        language: language || 'en',
-        isFinal: !!isFinal,
-        senderSessionId: session.sessionId.substring(0, 6),
-        timestamp: timestamp || Date.now(),
-      });
-    }
+    this.sendToPartner(session.pairedSessionId, {
+      type: 'VOICE_TRANSCRIPT',
+      id: id || `tr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      text: clean,
+      language: language || 'en',
+      isFinal: !!isFinal,
+      senderSessionId: session.sessionId.substring(0, 6),
+      timestamp: timestamp || Date.now(),
+    });
   }
 
   // --- Message Handling & Safety Moderation ---

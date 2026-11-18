@@ -3,6 +3,7 @@ import { Server as HttpServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { ologleEngine } from './signaling/serverCore.ts';
 import { createIceServerConfig } from './services/iceServers.ts';
+import { distributedState } from './services/distributedState.ts';
 import { sanitizeText } from './validation/index.ts';
 import {
   transcribeAudioWithGemini,
@@ -13,6 +14,7 @@ import {
 } from './services/geminiService.ts';
 
 const allowedOrigins = new Set([
+  'https://ologle-five.vercel.app',
   'https://ologle.network',
   'https://www.ologle.network',
   ...(process.env.ALLOWED_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean),
@@ -90,8 +92,8 @@ export function createOlogleApp(): Express {
 
   app.use(express.json({ limit: '25mb' }));
 
-  // CORS Middleware for API routes
-  app.use('/api', (req, res, next) => {
+  // CORS Middleware for all routes
+  app.use((req, res, next) => {
     const origin = req.get('origin');
     if (origin) {
       if (!isOriginAllowed(origin)) {
@@ -152,16 +154,29 @@ export function createOlogleApp(): Express {
   });
 
   // Health and Status Endpoints
-  app.get('/health', (_req, res) => {
+  const handleHealth = (_req: express.Request, res: express.Response) => {
+    const isProd = process.env.NODE_ENV === 'production';
+    const redisConfigured = distributedState.isConfigured();
+    const redisConnected = distributedState.isDistributed();
+    const status = (isProd && !redisConnected) ? 'degraded' : 'ok';
+
     res.json({
-      status: 'ok',
+      status,
       service: 'ologle-signaling',
       uptime: process.uptime(),
       timestamp: Date.now(),
       activeSessions: ologleEngine.getActiveSessionsCount(),
       queuedUsers: ologleEngine.getQueuedUsersCount(),
+      redis: {
+        configured: redisConfigured,
+        connected: redisConnected,
+        mode: redisConnected ? 'distributed' : (isProd ? 'degraded_in_memory' : 'in_memory'),
+      },
     });
-  });
+  };
+
+  app.get('/health', handleHealth);
+  app.get('/api/health', handleHealth);
 
   app.get('/', (_req, res) => {
     res.json({

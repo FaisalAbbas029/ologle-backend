@@ -1,6 +1,7 @@
 import { createOlogleApp, isOriginAllowed } from '../src/app.ts';
 import { WebSocketServer, WebSocket } from 'ws';
 import { ologleEngine } from '../src/signaling/serverCore.ts';
+import { distributedState } from '../src/services/distributedState.ts';
 
 const app = createOlogleApp();
 
@@ -16,7 +17,7 @@ function getWebSocketServer(): WebSocketServer {
     });
 
     wss.on('connection', (ws: WebSocket, req) => {
-      const origin = req.headers.origin;
+      const origin = (req.headers.origin as string) || (req.headers['sec-websocket-origin'] as string);
       if (origin && !isOriginAllowed(origin)) {
         ws.close(1008, 'Origin not allowed');
         return;
@@ -60,29 +61,74 @@ function getWebSocketServer(): WebSocketServer {
 }
 
 export default function handler(req: any, res: any) {
-  // Normalize original request URL when routed through Vercel rewrites
+  // Normalize original request URL when routed through Vercel rewrites (preserving query parameters)
   const matchedPath = req.headers['x-matched-path'] as string | undefined;
   if (matchedPath && req.url?.startsWith('/api/index')) {
-    req.url = matchedPath;
+    const queryIndex = req.url.indexOf('?');
+    const query = queryIndex !== -1 ? req.url.slice(queryIndex) : '';
+    req.url = matchedPath.includes('?') ? matchedPath : `${matchedPath}${query}`;
+  }
+
+  const rawUrl = req.url || '';
+  const pathname = rawUrl.split('?')[0];
+  const origin = (req.headers.origin as string) || (req.headers['sec-websocket-origin'] as string);
+
+  // Helper to send JSON responses with proper CORS headers across both Vercel & Node runtimes
+  const sendJson = (statusCode: number, data: any) => {
+    if (origin && isOriginAllowed(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    }
+    res.setHeader('Content-Type', 'application/json');
+    if (typeof res.status === 'function' && typeof res.json === 'function') {
+      return res.status(statusCode).json(data);
+    } else {
+      res.statusCode = statusCode;
+      return res.end(JSON.stringify(data));
+    }
+  };
+
+  // Handle CORS preflight for all endpoints routed through here
+  if (req.method === 'OPTIONS') {
+    if (origin && isOriginAllowed(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (typeof res.status === 'function') {
+      return res.status(204).end();
+    } else {
+      res.statusCode = 204;
+      return res.end();
+    }
   }
 
   // Handle direct health check endpoint
-  if (req.method === 'GET' && (req.url === '/health' || matchedPath === '/health')) {
-    res.setHeader('Content-Type', 'application/json');
-    return res.status(200).json({
-      status: 'ok',
+  if (req.method === 'GET' && (pathname === '/health' || pathname === '/api/health' || matchedPath === '/health' || matchedPath === '/api/health')) {
+    const isProd = process.env.NODE_ENV === 'production';
+    const redisConfigured = distributedState.isConfigured();
+    const redisConnected = distributedState.isDistributed();
+    const status = (isProd && !redisConnected) ? 'degraded' : 'ok';
+
+    return sendJson(200, {
+      status,
       service: 'ologle-signaling',
       uptime: process.uptime(),
       timestamp: Date.now(),
       activeSessions: ologleEngine.getActiveSessionsCount(),
       queuedUsers: ologleEngine.getQueuedUsersCount(),
+      redis: {
+        configured: redisConfigured,
+        connected: redisConnected,
+        mode: redisConnected ? 'distributed' : (isProd ? 'degraded_in_memory' : 'in_memory'),
+      },
     });
   }
 
   // Handle direct root status endpoint
-  if (req.method === 'GET' && (req.url === '/' || matchedPath === '/')) {
-    res.setHeader('Content-Type', 'application/json');
-    return res.status(200).json({
+  if (req.method === 'GET' && (pathname === '/' || matchedPath === '/')) {
+    return sendJson(200, {
       service: 'ologle-signaling',
       status: 'healthy',
       description: 'OLOGLE High-Performance WebRTC Signaling & Real-Time Matchmaking Backend',
@@ -98,19 +144,46 @@ export default function handler(req: any, res: any) {
     });
   }
 
+  // Handle plain HTTP request to /ws without WebSocket upgrade
+  const upgradeHeader = Array.isArray(req.headers.upgrade) ? req.headers.upgrade[0] : req.headers.upgrade;
+  const isWebSocketUpgrade = upgradeHeader && upgradeHeader.toLowerCase() === 'websocket';
+
+  if (!isWebSocketUpgrade && (pathname === '/ws' || matchedPath === '/ws')) {
+    if (res.writeHead) {
+      res.writeHead(426, {
+        'Content-Type': 'text/plain',
+        Upgrade: 'WebSocket',
+      });
+      return res.end('Upgrade Required: Connect via WebSocket (ws:// or wss://)');
+    }
+    res.statusCode = 426;
+    res.setHeader('Content-Type', 'text/plain');
+    res.setHeader('Upgrade', 'WebSocket');
+    return res.end('Upgrade Required: Connect via WebSocket (ws:// or wss://)');
+  }
+
   // Handle WebSocket upgrade request on Vercel Fluid Compute
-  if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') {
-    const origin = req.headers.origin;
+  if (isWebSocketUpgrade) {
     if (origin && !isOriginAllowed(origin)) {
       if (res.writeHead) {
         res.writeHead(403, { 'Content-Type': 'text/plain' });
-        res.end('Origin not allowed');
+        return res.end('Origin not allowed');
       }
-      return;
+      res.statusCode = 403;
+      return res.end('Origin not allowed');
+    }
+
+    const socket = req.socket || res.socket;
+    if (!socket) {
+      if (res.writeHead) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        return res.end('Socket connection unavailable');
+      }
+      res.statusCode = 500;
+      return res.end('Socket connection unavailable');
     }
 
     const server = getWebSocketServer();
-    const socket = req.socket;
     const head = Buffer.alloc(0);
     server.handleUpgrade(req, socket, head, (ws) => {
       server.emit('connection', ws, req);
@@ -118,6 +191,6 @@ export default function handler(req: any, res: any) {
     return;
   }
 
-  // Handle standard HTTP requests
+  // Handle standard HTTP requests via Express
   return app(req, res);
 }

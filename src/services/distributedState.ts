@@ -43,14 +43,28 @@ export class DistributedStateManager {
 
   constructor() {
     const redisUrl = process.env.REDIS_URL?.trim();
+    const isProd = process.env.NODE_ENV === 'production';
     if (redisUrl) {
       this.initRedis(redisUrl);
     } else {
-      console.log('[OLOGLE State] In-Memory Mode active (Fluid Compute optimized). Configure REDIS_URL to enable cross-instance clustering.');
+      if (isProd) {
+        console.error(
+          '[OLOGLE State] CRITICAL: REDIS_URL is not configured in production environment! Running in degraded single-instance mode. Multi-instance Vercel Functions cannot route WebSockets, matchmaking, or WebRTC signaling across instances without Redis.'
+        );
+      } else {
+        console.log(
+          '[OLOGLE State] In-Memory Mode active (development/test). Configure REDIS_URL to enable cross-instance clustering.'
+        );
+      }
     }
   }
 
+  public isConfigured(): boolean {
+    return Boolean(process.env.REDIS_URL?.trim());
+  }
+
   private initRedis(url: string): void {
+    const isProd = process.env.NODE_ENV === 'production';
     try {
       // 1. Dedicated Command & Publisher Client
       this.pubClient = new Redis(url, {
@@ -74,7 +88,11 @@ export class DistributedStateManager {
           console.log('[OLOGLE State] Connected to distributed Redis cluster for cross-instance matching.');
         })
         .catch((err) => {
-          console.warn('[OLOGLE State] Redis publisher connection failed, continuing in in-memory mode:', err.message);
+          if (isProd) {
+            console.error('[OLOGLE State] CRITICAL: Redis publisher connection failed in production:', err.message);
+          } else {
+            console.warn('[OLOGLE State] Redis publisher connection failed, continuing in in-memory mode:', err.message);
+          }
           this.isConnected = false;
         });
 
@@ -89,17 +107,33 @@ export class DistributedStateManager {
           });
         })
         .catch((err) => {
-          console.warn('[OLOGLE State] Redis subscriber connection failed:', err.message);
+          if (isProd) {
+            console.error('[OLOGLE State] CRITICAL: Redis subscriber connection failed in production:', err.message);
+          } else {
+            console.warn('[OLOGLE State] Redis subscriber connection failed:', err.message);
+          }
         });
 
       this.pubClient.on('error', (err) => {
-        console.warn('[OLOGLE State] Redis client error (falling back to memory):', err.message);
+        if (isProd) {
+          console.error('[OLOGLE State] CRITICAL: Redis client error in production:', err.message);
+        } else {
+          console.warn('[OLOGLE State] Redis client error (falling back to memory):', err.message);
+        }
       });
       this.subClient.on('error', (err) => {
-        console.warn('[OLOGLE State] Redis subscriber error (falling back to memory):', err.message);
+        if (isProd) {
+          console.error('[OLOGLE State] CRITICAL: Redis subscriber error in production:', err.message);
+        } else {
+          console.warn('[OLOGLE State] Redis subscriber error (falling back to memory):', err.message);
+        }
       });
     } catch (e: any) {
-      console.warn('[OLOGLE State] Failed to initialize Redis clients, continuing in memory:', e.message);
+      if (isProd) {
+        console.error('[OLOGLE State] CRITICAL: Failed to initialize Redis clients in production:', e.message);
+      } else {
+        console.warn('[OLOGLE State] Failed to initialize Redis clients, continuing in memory:', e.message);
+      }
       this.isConnected = false;
     }
   }
@@ -198,6 +232,22 @@ export class DistributedStateManager {
       return Object.values(entries).map((item) => JSON.parse(item));
     } catch {
       return [];
+    }
+  }
+
+  /**
+   * Atomically claims a queue ticket across distributed instances using Redis HDEL.
+   * Returns true if this instance successfully claimed the ticket (HDEL returned 1),
+   * or false if another instance already claimed it concurrently.
+   */
+  public async claimQueueTicket(sessionId: string, mode: string = 'default'): Promise<boolean> {
+    if (!this.isConnected || !this.pubClient) return false;
+    try {
+      const result = await this.pubClient.hdel(`ologle:queue:${mode}`, sessionId);
+      return result === 1;
+    } catch (err: any) {
+      console.warn('[OLOGLE State] Failed to claim queue ticket:', err.message);
+      return false;
     }
   }
 
