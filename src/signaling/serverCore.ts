@@ -17,6 +17,7 @@ import { MatchmakerQueue, calculateCompatibility } from '../matchmaking/matchmak
 import type { QueuedSession, MatchScoreResult } from '../matchmaking/matchmaker.ts';
 import { validateProfession, validateInterests } from '../validation/index.ts';
 import type { ScoreBreakdown, EphemeralLiveTicket } from '../types/index.ts';
+import { distributedState } from '../services/distributedState.ts';
 
 /**
  * Transient volatile in-memory cache with automated TTL purge.
@@ -511,6 +512,22 @@ export class OlogleEngine {
         messageTimestamps: [],
       };
       this.sessions.set(sessionId, session);
+
+      // Async recovery from distributed state if reconnecting to a different cluster node
+      if (existingId && distributedState.isDistributed()) {
+        distributedState.getSessionState(sessionId).then((cached) => {
+          if (cached && session) {
+            session.visitorId = cached.visitorId || session.visitorId;
+            session.profession = cached.profession || session.profession;
+            session.interests = cached.interests || session.interests;
+            session.country = cached.country || session.country;
+            session.sessionMode = cached.sessionMode || session.sessionMode;
+            session.currentMode = (cached.currentMode as any) || session.currentMode;
+            session.pairedSessionId = cached.pairedSessionId;
+            session.currentRoomId = cached.currentRoomId;
+          }
+        }).catch(() => {});
+      }
     } else {
       session.ws = ws;
       session.lastActivity = now;
@@ -520,6 +537,11 @@ export class OlogleEngine {
     }
 
     this.send(ws, { type: 'SESSION_REGISTERED', sessionId });
+    distributedState.subscribeToSession(sessionId, (msg) => {
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(msg);
+      }
+    });
     return session;
   }
 
@@ -527,12 +549,14 @@ export class OlogleEngine {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
+    distributedState.unsubscribeFromSession(sessionId);
     session.ws = null;
     session.lastActivity = Date.now();
 
     // Handle leave based on active mode
     if (session.currentMode === 'matching') {
       this.matchQueue.remove(sessionId);
+      distributedState.removeQueueTicket(sessionId, session.sessionMode || 'default');
     } else if (session.currentMode === '1on1' && session.pairedSessionId) {
       this.notifyPartnerLeft(session.pairedSessionId, 'disconnected');
       const partner = this.sessions.get(session.pairedSessionId);
@@ -546,6 +570,19 @@ export class OlogleEngine {
     } else if (session.currentMode === 'class' && session.currentRoomId) {
       this.leaveClass(session);
     }
+
+    distributedState.setSessionState(sessionId, {
+      sessionId: session.sessionId,
+      visitorId: session.visitorId,
+      profession: session.profession,
+      interests: session.interests,
+      country: session.country,
+      sessionMode: session.sessionMode,
+      currentMode: session.currentMode,
+      pairedSessionId: session.pairedSessionId,
+      currentRoomId: session.currentRoomId,
+      lastActivity: session.lastActivity,
+    }, 15);
 
     session.currentMode = 'none';
     session.currentRoomId = null;
@@ -890,12 +927,22 @@ export class OlogleEngine {
     } else {
       // Put in queue
       this.matchQueue.enqueue(queuedSession);
+      distributedState.registerQueueTicket({
+        sessionId: session.sessionId,
+        visitorId: session.visitorId,
+        profession: cleanProf,
+        interests: session.interests,
+        country: session.country,
+        sessionMode: session.sessionMode,
+        timestamp: Date.now(),
+      });
     }
   }
 
   private cancelMatching(session: EphemeralSession): void {
     if (session.currentMode === 'matching') {
       this.matchQueue.remove(session.sessionId);
+      distributedState.removeQueueTicket(session.sessionId, session.sessionMode || 'default');
       session.currentMode = 'none';
       if (session.ws) {
         this.send(session.ws, PRE_SERIALIZED_MESSAGES.MATCHING_CANCELED);
@@ -934,6 +981,9 @@ export class OlogleEngine {
     sessionB.currentMode = '1on1';
     sessionB.pairedSessionId = sessionA.sessionId;
     sessionB.currentRoomId = roomId;
+
+    distributedState.removeQueueTicket(sessionA.sessionId, sessionA.sessionMode || 'default');
+    distributedState.removeQueueTicket(candidateB.sessionId, candidateB.mode || 'default');
 
     const professionBonus = Boolean(scoreResult.isSharedProfession || scoreResult.isComplementaryProfession);
     const countryBonus = Boolean(sessionA.country && sessionA.country !== 'GLOBAL' && sessionA.country === sessionB.country);
@@ -1272,7 +1322,6 @@ export class OlogleEngine {
     const partner = this.sessions.get(session.pairedSessionId);
     if (
       !partner ||
-      !partner.ws ||
       partner.currentMode !== '1on1' ||
       partner.pairedSessionId !== session.sessionId ||
       partner.currentRoomId !== session.currentRoomId ||
@@ -1284,7 +1333,7 @@ export class OlogleEngine {
       return;
     }
 
-    this.send(partner.ws, { type: 'WEBRTC_SIGNAL', signal });
+    this.sendToPartner(session.pairedSessionId, { type: 'WEBRTC_SIGNAL', signal });
   }
 
   private handleVoiceTranscript(
@@ -1432,30 +1481,24 @@ export class OlogleEngine {
       });
     }
 
-    const partner = this.sessions.get(session.pairedSessionId);
-    if (partner && partner.ws) {
-      this.send(partner.ws, {
-        type: 'RECEIVE_1ON1_MESSAGE',
-        id: messageId,
-        text,
-        sender: 'peer',
-        timestamp: now,
-      });
-    }
+    this.sendToPartner(session.pairedSessionId, {
+      type: 'RECEIVE_1ON1_MESSAGE',
+      id: messageId,
+      text,
+      sender: 'peer',
+      timestamp: now,
+    });
   }
 
   private handleMessageRead(session: EphemeralSession, messageId: string): void {
     if (!messageId || typeof messageId !== 'string') return;
     if (session.currentMode !== '1on1' || !session.pairedSessionId) return;
 
-    const partner = this.sessions.get(session.pairedSessionId);
-    if (partner && partner.ws) {
-      this.send(partner.ws, {
-        type: 'MESSAGE_READ',
-        messageId,
-        readAt: Date.now(),
-      });
-    }
+    this.sendToPartner(session.pairedSessionId, {
+      type: 'MESSAGE_READ',
+      messageId,
+      readAt: Date.now(),
+    });
   }
 
   // --- Community Rooms ---
@@ -1805,10 +1848,17 @@ export class OlogleEngine {
     partnerId: string,
     reason: 'skipped' | 'ended' | 'disconnected' | 'reported' | 'blocked'
   ): void {
+    const preSerialized = PRE_SERIALIZED_PARTNER_LEFT[reason];
+    this.sendToPartner(partnerId, preSerialized || { type: 'PARTNER_LEFT', reason });
+  }
+
+  private sendToPartner(partnerId: string, message: ServerMessage | string): void {
     const partner = this.sessions.get(partnerId);
-    if (partner && partner.ws) {
-      const preSerialized = PRE_SERIALIZED_PARTNER_LEFT[reason];
-      this.send(partner.ws, preSerialized || { type: 'PARTNER_LEFT', reason });
+    if (partner && partner.ws && partner.ws.readyState === WebSocket.OPEN) {
+      this.send(partner.ws, message);
+    } else {
+      const payload = typeof message === 'string' ? message : JSON.stringify(message);
+      distributedState.publishToSession(partnerId, payload);
     }
   }
 
