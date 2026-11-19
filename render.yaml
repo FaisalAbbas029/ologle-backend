@@ -2,7 +2,7 @@ services:
   - type: web
     name: ologle-backend
     runtime: node
-    plan: free
+    plan: starter
     region: oregon
     buildCommand: npm ci && npm run build
     startCommand: npm start
@@ -14,9 +14,15 @@ services:
       - key: PORT
         value: "3000"
       - key: ALLOWED_ORIGINS
-        value: https://ologle.vercel.app,https://ologle.network,https://www.ologle.network
+        value: https://ologle-five.vercel.app,https://ologle.vercel.app,https://ologle.network,https://www.ologle.network
       - key: RENDER
         value: "true"
+      - key: SESSION_RECOVERY_WINDOW_MS
+        value: "20000"
+      - key: HEARTBEAT_INTERVAL_MS
+        value: "20000"
+      - key: REDIS_URL
+        sync: false
       - key: TURN_URLS
         sync: false
       - key: TURN_SHARED_SECRET

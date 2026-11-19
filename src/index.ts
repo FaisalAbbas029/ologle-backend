@@ -6,6 +6,13 @@ const PORT = Number(process.env.PORT) || 3000;
 const app = createOlogleApp();
 const server = createServer(app);
 
+// Disable Node HTTP request/socket timeouts so upgraded WebSocket connections
+// remain active indefinitely without any 5-minute or 15-minute ceiling.
+server.timeout = 0;
+server.requestTimeout = 0;
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+
 // Attach the WebSocket protocol handler on /ws
 const wss = attachWebSocketServer(server);
 
@@ -59,15 +66,16 @@ server.listen(PORT, '0.0.0.0', () => {
 
     const PING_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
     setInterval(() => {
-      import('http').then(({ default: http }) => {
-        const req = http.get(selfUrl, (res) => {
+      const protocolModule = selfUrl.startsWith('https:') ? 'https' : 'http';
+      import(protocolModule).then(({ default: client }) => {
+        const req = client.get(selfUrl, (res: any) => {
           res.resume();
           console.log(`[keep-alive] Self-ping status: ${res.statusCode}`);
         });
-        req.on('error', (err) => console.warn('[keep-alive] Self-ping failed:', err.message));
+        req.on('error', (err: any) => console.warn('[keep-alive] Self-ping failed:', err.message));
         req.end();
       }).catch(() => {});
-    }, PING_INTERVAL_MS);
+    }, PING_INTERVAL_MS).unref();
   }
 });
 

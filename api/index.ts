@@ -41,11 +41,14 @@ function getWebSocketServer(): WebSocketServer {
       (ws as any).isAlive = true;
       ws.on('pong', () => {
         (ws as any).isAlive = true;
+        session.lastActivity = Date.now();
       });
 
       const onCleanup = () => {
         ws.removeAllListeners();
-        ologleEngine.handleDisconnect(session.sessionId);
+        if (session.ws === (ws as any)) {
+          ologleEngine.handleDisconnect(session.sessionId);
+        }
       };
 
       ws.on('message', (data) => {

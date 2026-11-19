@@ -177,8 +177,38 @@ describe('OLOGLE Backend Full Integration & E2E Signaling', () => {
     const chatMsg = messages1.find((m) => m.type === 'RECEIVE_1ON1_MESSAGE');
     expect(chatMsg.text).toBe('Hello from Peer 2!');
 
-    // Test Clean Disconnect and Partner Notification
+    // Test Temporary Disconnect -> Reconnect with ?sessionId=... Preserves Active Chat
+    const session1Id = messages1.find((m) => m.type === 'SESSION_REGISTERED').sessionId;
     ws1.close();
+
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (messages2.some((m) => m.type === 'PARTNER_RECONNECTING')) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 20);
+    });
+    expect(messages2.some((m) => m.type === 'PARTNER_LEFT')).toBe(false);
+
+    // Reconnect Peer 1 using existing sessionId
+    const ws1Resumed = new WebSocket(`${wsUrl}?sessionId=${encodeURIComponent(session1Id)}`);
+    ws1Resumed.on('message', (d) => messages1.push(JSON.parse(d.toString())));
+
+    await new Promise<void>((resolve) => {
+      const check = setInterval(() => {
+        if (
+          messages1.some((m) => m.type === 'SESSION_RESTORED') &&
+          messages2.some((m) => m.type === 'PARTNER_RECONNECTED')
+        ) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 20);
+    });
+
+    // Test Manual Disconnect (END_CONVERSATION) and Partner Notification
+    ws1Resumed.send(JSON.stringify({ type: 'END_CONVERSATION' }));
 
     await new Promise<void>((resolve) => {
       const check = setInterval(() => {
@@ -186,12 +216,13 @@ describe('OLOGLE Backend Full Integration & E2E Signaling', () => {
           clearInterval(check);
           resolve();
         }
-      }, 50);
+      }, 20);
     });
 
     const leftMsg = messages2.find((m) => m.type === 'PARTNER_LEFT');
-    expect(leftMsg.reason).toBe('disconnected');
+    expect(leftMsg.reason).toBe('ended');
 
+    ws1Resumed.close();
     ws2.close();
   });
 });

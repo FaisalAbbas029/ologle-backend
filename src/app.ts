@@ -343,7 +343,7 @@ export function createOlogleApp(): Express {
   return app;
 }
 
-export function attachWebSocketServer(server: HttpServer): WebSocketServer {
+export function attachWebSocketServer(server: HttpServer, engine = ologleEngine): WebSocketServer {
   const wss = new WebSocketServer({
     server,
     path: '/ws',
@@ -354,10 +354,16 @@ export function attachWebSocketServer(server: HttpServer): WebSocketServer {
   });
 
   wss.on('connection', (ws: WebSocket, req) => {
-    const origin = req.headers.origin;
+    const origin = (req.headers.origin as string) || (req.headers['sec-websocket-origin'] as string);
     if (origin && !isOriginAllowed(origin)) {
       ws.close(1008, 'Origin not allowed');
       return;
+    }
+
+    if (req.socket) {
+      req.socket.setTimeout?.(0);
+      req.socket.setNoDelay?.(true);
+      req.socket.setKeepAlive?.(true, 20000);
     }
 
     const forwarded = req.headers['x-forwarded-for'];
@@ -365,29 +371,32 @@ export function attachWebSocketServer(server: HttpServer): WebSocketServer {
       ? forwarded.split(',')[0].trim()
       : req.socket.remoteAddress || '127.0.0.1';
 
-    // Parse URL query parameter for idempotent session resumption (15s grace window)
+    // Parse URL query parameter for idempotent session resumption (20s recovery window)
     let existingSessionId: string | undefined;
     try {
       const url = new URL(req.url || '', 'http://localhost');
       existingSessionId = url.searchParams.get('sessionId') || undefined;
     } catch {}
 
-    const session = ologleEngine.registerSession(ws as any, existingSessionId, ip);
+    const session = engine.registerSession(ws as any, existingSessionId, ip);
 
     // Heartbeat watchdog initialization
     (ws as any).isAlive = true;
     ws.on('pong', () => {
       (ws as any).isAlive = true;
+      session.lastActivity = Date.now();
     });
 
     const onCleanup = () => {
       ws.removeAllListeners();
-      ologleEngine.handleDisconnect(session.sessionId);
+      if (session.ws === (ws as any)) {
+        engine.handleDisconnect(session.sessionId);
+      }
     };
 
     ws.on('message', (data) => {
       (ws as any).isAlive = true;
-      ologleEngine.processMessage(session.sessionId, data.toString());
+      engine.processMessage(session.sessionId, data.toString());
     });
 
     ws.on('close', onCleanup);

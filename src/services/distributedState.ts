@@ -1,11 +1,11 @@
 /**
  * OLOGLE Distributed State & Cross-Instance Pub/Sub Manager
  * Enables seamless cross-instance WebSockets, queue matching, and session recovery
- * when deployed across multiple Vercel Function instances (Fluid Compute).
+ * when deployed across multiple backend instances.
  *
  * Invariant Guarantees:
  * 1. Dedicated Connections: Separate Redis Publisher and Subscriber clients (ioredis requirement).
- * 2. In-Memory Graceful Fallback: Runs 100% in-memory with zero crashes when REDIS_URL is omitted or unreachable.
+ * 2. Non-Silent Production Alerting: Logs CRITICAL errors and flags degraded status in production if Redis is omitted or unreachable.
  * 3. Ephemeral TTL Persistence: Preserves privacy-by-design (zero disk persistence; session and presence keys expire in seconds).
  * 4. Cross-Instance Signaling: Publishes events to `ologle:session:<sessionId>` for instant delivery across instances.
  */
@@ -15,6 +15,7 @@ import Redis from 'ioredis';
 export interface SharedSessionData {
   sessionId: string;
   visitorId: string;
+  ipAddress?: string;
   profession: string;
   interests: string[];
   country?: string;
@@ -23,16 +24,31 @@ export interface SharedSessionData {
   pairedSessionId: string | null;
   currentRoomId: string | null;
   lastActivity: number;
+  isRecovering?: boolean;
+  partnerProfession?: string;
+  partnerCountry?: string;
+  partnerVisitorId?: string;
+  sharedInterests?: string[];
+  sharedTopics?: string[];
+  matchScore?: number;
+  scoreBreakdown?: any;
+  isInitiator?: boolean;
+  endedWhileOfflineReason?: 'skipped' | 'ended' | 'disconnected' | 'reported' | 'blocked' | null;
+  blockedSessionIds?: string[];
+  blockedVisitorIds?: string[];
 }
 
 export interface SharedQueueTicket {
   sessionId: string;
   visitorId: string;
+  ipAddress?: string;
   profession: string;
   interests: string[];
   country?: string;
   sessionMode?: string;
   timestamp: number;
+  blockedSessionIds?: string[];
+  blockedVisitorIds?: string[];
 }
 
 export class DistributedStateManager {
@@ -41,7 +57,15 @@ export class DistributedStateManager {
   private isConnected = false;
   private subscriptions = new Map<string, (msg: string) => void>();
 
-  constructor() {
+  constructor(customClients?: { pubClient: Redis; subClient: Redis }) {
+    if (customClients) {
+      this.pubClient = customClients.pubClient;
+      this.subClient = customClients.subClient;
+      this.isConnected = true;
+      this.bindSubscriberEvents();
+      return;
+    }
+
     const redisUrl = process.env.REDIS_URL?.trim();
     const isProd = process.env.NODE_ENV === 'production';
     if (redisUrl) {
@@ -49,7 +73,7 @@ export class DistributedStateManager {
     } else {
       if (isProd) {
         console.error(
-          '[OLOGLE State] CRITICAL: REDIS_URL is not configured in production environment! Running in degraded single-instance mode. Multi-instance Vercel Functions cannot route WebSockets, matchmaking, or WebRTC signaling across instances without Redis.'
+          '[OLOGLE State] CRITICAL: REDIS_URL is not configured in production environment! Running in degraded single-instance mode. Multi-instance deployments cannot route WebSockets, matchmaking, or WebRTC signaling across instances without Redis.'
         );
       } else {
         console.log(
@@ -60,7 +84,21 @@ export class DistributedStateManager {
   }
 
   public isConfigured(): boolean {
-    return Boolean(process.env.REDIS_URL?.trim());
+    return Boolean(process.env.REDIS_URL?.trim()) || this.isConnected;
+  }
+
+  private bindSubscriberEvents(): void {
+    if (!this.subClient) return;
+    this.subClient.on('message', (channel: string, message: string) => {
+      const sessionId = channel.replace('ologle:session:', '');
+      const handler = this.subscriptions.get(sessionId);
+      if (handler) {
+        handler(message);
+      }
+    });
+    for (const sessionId of this.subscriptions.keys()) {
+      this.subClient.subscribe(`ologle:session:${sessionId}`).catch(() => {});
+    }
   }
 
   private initRedis(url: string): void {
@@ -82,6 +120,25 @@ export class DistributedStateManager {
         reconnectOnError: () => 1,
       });
 
+      this.bindSubscriberEvents();
+
+      this.pubClient.on('ready', () => {
+        this.isConnected = true;
+      });
+      this.pubClient.on('close', () => {
+        this.isConnected = false;
+      });
+      this.pubClient.on('end', () => {
+        this.isConnected = false;
+      });
+
+      this.subClient.on('ready', () => {
+        // Re-subscribe all active local sessions whenever the subscriber connects or reconnects
+        for (const sessionId of this.subscriptions.keys()) {
+          this.subClient?.subscribe(`ologle:session:${sessionId}`).catch(() => {});
+        }
+      });
+
       this.pubClient.connect()
         .then(() => {
           this.isConnected = true;
@@ -97,15 +154,6 @@ export class DistributedStateManager {
         });
 
       this.subClient.connect()
-        .then(() => {
-          this.subClient?.on('message', (channel, message) => {
-            const sessionId = channel.replace('ologle:session:', '');
-            const handler = this.subscriptions.get(sessionId);
-            if (handler) {
-              handler(message);
-            }
-          });
-        })
         .catch((err) => {
           if (isProd) {
             console.error('[OLOGLE State] CRITICAL: Redis subscriber connection failed in production:', err.message);
@@ -205,13 +253,13 @@ export class DistributedStateManager {
 
   // --- Shared Matching Queue Coordination ---
 
-  public async registerQueueTicket(ticket: SharedQueueTicket, ttlSeconds: number = 30): Promise<void> {
+  public async registerQueueTicket(ticket: SharedQueueTicket, ttlSeconds: number = 60): Promise<void> {
     if (!this.isConnected || !this.pubClient) return;
     try {
       const mode = ticket.sessionMode || 'default';
       const key = `ologle:queue:${mode}`;
       await this.pubClient.hset(key, ticket.sessionId, JSON.stringify(ticket));
-      await this.pubClient.expire(key, 60);
+      await this.pubClient.expire(key, ttlSeconds);
     } catch (err: any) {
       console.warn('[OLOGLE State] Failed to register queue ticket in Redis:', err.message);
     }
