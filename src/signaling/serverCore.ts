@@ -262,6 +262,8 @@ export class OlogleEngine {
 
   // Active ping-pong watchdog timer & reconnection idempotency timers
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  private distributedQueueSyncTimer: NodeJS.Timeout | null = null;
+  private distributedMatchInFlight = new Set<string>();
   private disconnectTimers: Map<string, NodeJS.Timeout> = new Map();
   private reconnectGraceWindowMs: number = Number(process.env.SESSION_RECOVERY_WINDOW_MS) || 20000; // 20-second recovery window ONLY for unexpected connection loss
   private heartbeatIntervalMs: number = Number(process.env.HEARTBEAT_INTERVAL_MS) || 20000; // 20-second keep-alive ping
@@ -458,6 +460,64 @@ export class OlogleEngine {
     }, this.heartbeatIntervalMs);
     if (this.heartbeatTimer && typeof this.heartbeatTimer === 'object' && 'unref' in this.heartbeatTimer) {
       this.heartbeatTimer.unref();
+    }
+    this.startDistributedQueueSync();
+  }
+
+  private getQueueMode(mode?: string): string {
+    return (mode || 'video').trim().toLowerCase();
+  }
+
+  private startDistributedQueueSync(): void {
+    if (this.distributedQueueSyncTimer) clearInterval(this.distributedQueueSyncTimer);
+    this.distributedQueueSyncTimer = setInterval(() => {
+      if (this.matchQueue.size() === 0) return;
+      if (!this.stateManager.isConfigured()) return;
+
+      for (const session of this.sessions.values()) {
+        if (session.currentMode !== 'matching' || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
+          continue;
+        }
+        const queueMode = this.getQueueMode(session.sessionMode);
+        const queuedSession: QueuedSession = {
+          sessionId: session.sessionId,
+          visitorId: session.visitorId,
+          ipAddress: session.ipAddress,
+          isLoopback: session.isLoopback,
+          profession: session.profession,
+          interests: session.interests,
+          country: session.country || 'GLOBAL',
+          mode: queueMode,
+          queuedAt: session.lastActivity || Date.now(),
+          blockedSessionIds: session.blockedSessionIds,
+          blockedVisitorIds: session.blockedVisitorIds,
+          matchedSessionId: null,
+        };
+
+        void this.stateManager.registerQueueTicket(
+          {
+            sessionId: session.sessionId,
+            visitorId: session.visitorId,
+            ipAddress: session.ipAddress,
+            profession: session.profession,
+            interests: session.interests,
+            country: session.country || 'GLOBAL',
+            sessionMode: queueMode,
+            timestamp: Date.now(),
+            blockedSessionIds: Array.from(session.blockedSessionIds),
+            blockedVisitorIds: Array.from(session.blockedVisitorIds),
+          },
+          60
+        );
+        void this.tryMatchFromSharedQueue(session, queuedSession);
+      }
+    }, 2000);
+    if (
+      this.distributedQueueSyncTimer &&
+      typeof this.distributedQueueSyncTimer === 'object' &&
+      'unref' in this.distributedQueueSyncTimer
+    ) {
+      this.distributedQueueSyncTimer.unref();
     }
   }
 
@@ -839,8 +899,9 @@ export class OlogleEngine {
     // Handle unexpected socket drop based on active mode
     if (session.currentMode === 'matching') {
       this.matchQueue.remove(sessionId);
-      this.stateManager.removeQueueTicket(sessionId, session.sessionMode || 'default');
+      void this.stateManager.removeQueueTicket(sessionId, this.getQueueMode(session.sessionMode));
       session.currentMode = 'none';
+      console.log(`[OLOGLE WS] Disconnected while matching; removed queue ticket session=${sessionId.slice(0, 10)}`);
     } else if (session.currentMode === '1on1' && session.pairedSessionId) {
       // Preserve active 1-on-1 room during the recovery grace window!
       // Do NOT send PARTNER_LEFT immediately on transient network loss.
@@ -1222,11 +1283,13 @@ export class OlogleEngine {
     }
 
     const activeInterests = interestValidation.sanitized;
+    const previousQueueMode = this.getQueueMode(session.sessionMode);
+    const queueMode = this.getQueueMode(mode || session.sessionMode);
+    session.sessionMode = queueMode;
 
-    // Clear existing paired state and remove any prior queue entry to prevent duplicate matchmaking
+    // Clear existing paired state and remove any prior local queue entry to prevent duplicate matchmaking
     this.cleanCurrentSessionState(session);
     this.matchQueue.remove(session.sessionId);
-    this.stateManager.removeQueueTicket(session.sessionId, session.sessionMode || 'default');
 
     session.profession = cleanProf;
     session.interests = activeInterests;
@@ -1242,55 +1305,121 @@ export class OlogleEngine {
       profession: session.profession,
       interests: session.interests,
       country: session.country || 'GLOBAL',
-      mode: session.sessionMode || 'video',
+      mode: queueMode,
       queuedAt: Date.now(),
       blockedSessionIds: session.blockedSessionIds,
       blockedVisitorIds: session.blockedVisitorIds,
       matchedSessionId: null,
     };
 
+    console.log(
+      `[OLOGLE Matchmaker] START_MATCHING session=${session.sessionId.slice(0, 10)} mode=${queueMode} country=${queuedSession.country} interests=${activeInterests.length}`
+    );
+
     if (session.ws) {
       this.send(session.ws, PRE_SERIALIZED_MESSAGES.MATCHING_STARTED);
     }
 
-    // Try finding an immediate compatible match in queue
+    // Try finding an immediate compatible match in local queue
     const match = this.matchQueue.findBestMatch(queuedSession);
 
     if (match) {
       this.pairSessions(session, match.matchedSession, match.scoreResult);
     } else {
-      // Put in queue
+      // Put in local queue
       this.matchQueue.enqueue(queuedSession);
-      this.stateManager.registerQueueTicket({
-        sessionId: session.sessionId,
-        visitorId: session.visitorId,
-        ipAddress: session.ipAddress,
-        profession: cleanProf,
-        interests: session.interests,
-        country: session.country,
-        sessionMode: session.sessionMode,
-        timestamp: Date.now(),
-        blockedSessionIds: Array.from(session.blockedSessionIds),
-        blockedVisitorIds: Array.from(session.blockedVisitorIds),
-      });
-      this.syncSessionToRedis(session, 120);
 
-      // If distributed clustering is active, attempt cross-instance match
-      if (this.stateManager.isDistributed()) {
-        this.tryMatchFromSharedQueue(session, queuedSession);
+      // Perform ordered distributed Redis queue registration + cross-instance matching
+      if (this.stateManager.isConfigured()) {
+        void this.enqueueAndMatchDistributed(session, queuedSession, previousQueueMode, queueMode);
       }
+    }
+  }
+
+  private async enqueueAndMatchDistributed(
+    session: EphemeralSession,
+    queuedSession: QueuedSession,
+    previousQueueMode: string,
+    queueMode: string
+  ): Promise<void> {
+    try {
+      const connected = await this.stateManager.ensureConnected(2500);
+      if (!connected) {
+        console.warn(
+          `[OLOGLE Matchmaker] Redis unavailable during START_MATCHING for session=${session.sessionId.slice(0, 10)}; staying in local queue.`
+        );
+        return;
+      }
+
+      if (session.currentMode !== 'matching' || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      // Ensure subscriber channel is active BEFORE advertising ticket in Redis
+      await this.stateManager.ensureSessionSubscribed(session.sessionId);
+
+      // Clean up any stale ticket under a previous mode before registering the current one
+      if (previousQueueMode !== queueMode) {
+        await this.stateManager.removeQueueTicket(session.sessionId, previousQueueMode);
+      }
+
+      // First try matching against an already-waiting remote user before advertising ourselves
+      const matchedImmediately = await this.tryMatchFromSharedQueue(session, queuedSession);
+      if (matchedImmediately || session.currentMode !== 'matching') {
+        return;
+      }
+
+      // Register in shared Redis queue so other instances can find and claim this session
+      await this.stateManager.registerQueueTicket(
+        {
+          sessionId: session.sessionId,
+          visitorId: session.visitorId,
+          ipAddress: session.ipAddress,
+          profession: session.profession,
+          interests: session.interests,
+          country: session.country || 'GLOBAL',
+          sessionMode: queueMode,
+          timestamp: Date.now(),
+          blockedSessionIds: Array.from(session.blockedSessionIds),
+          blockedVisitorIds: Array.from(session.blockedVisitorIds),
+        },
+        60
+      );
+      this.syncSessionToRedis(session, 120);
+      console.log(
+        `[OLOGLE Matchmaker] Queued in Redis session=${session.sessionId.slice(0, 10)} mode=${queueMode}`
+      );
+
+      // Re-check shared queue once more to close simultaneous cross-instance join windows
+      if (session.currentMode === 'matching') {
+        await this.tryMatchFromSharedQueue(session, queuedSession);
+      }
+    } catch (err: any) {
+      console.warn('[OLOGLE Matchmaker] Distributed enqueue error:', err?.message || err);
     }
   }
 
   private async tryMatchFromSharedQueue(session: EphemeralSession, queuedSession: QueuedSession): Promise<boolean> {
     if (!this.stateManager.isDistributed()) return false;
+    if (session.currentMode !== 'matching' || !session.ws || session.ws.readyState !== WebSocket.OPEN) return false;
+    if (this.distributedMatchInFlight.has(session.sessionId)) return false;
+
+    this.distributedMatchInFlight.add(session.sessionId);
     try {
-      const mode = session.sessionMode || 'default';
+      const mode = this.getQueueMode(session.sessionMode);
       const tickets = await this.stateManager.getSharedQueueTickets(mode);
       if (!tickets || tickets.length === 0) return false;
 
+      const now = Date.now();
+      const MAX_TICKET_AGE_MS = 90_000;
+
       const candidates = tickets.filter((t) => {
+        if (!t || !t.sessionId) return false;
         if (t.sessionId === session.sessionId) return false;
+        if (t.timestamp && now - t.timestamp > MAX_TICKET_AGE_MS) return false;
+        if (!session.isLoopback && session.visitorId && t.visitorId && t.visitorId === session.visitorId) {
+          return false;
+        }
         if (session.blockedSessionIds?.has(t.sessionId)) return false;
         if (t.visitorId && session.blockedVisitorIds?.has(t.visitorId)) return false;
         if (Array.isArray(t.blockedSessionIds) && t.blockedSessionIds.includes(session.sessionId)) return false;
@@ -1308,49 +1437,52 @@ export class OlogleEngine {
 
       if (candidates.length === 0) return false;
 
-      let bestCandidate: (typeof candidates)[0] | null = null;
-      let bestScoreResult: MatchScoreResult | null = null;
-
-      for (const candidate of candidates) {
-        const candidateQueued: QueuedSession = {
-          sessionId: candidate.sessionId,
-          visitorId: candidate.visitorId,
-          profession: candidate.profession || 'Undisclosed',
-          interests: candidate.interests || [],
-          country: candidate.country || 'GLOBAL',
-          mode: candidate.sessionMode || 'video',
-          queuedAt: candidate.timestamp || Date.now(),
-          blockedSessionIds: new Set(),
-          matchedSessionId: null,
-        };
-
-        const scoreResult = calculateCompatibility(queuedSession, candidateQueued);
-        if (!bestScoreResult || scoreResult.score > bestScoreResult.score) {
-          bestScoreResult = scoreResult;
-          bestCandidate = candidate;
-        }
-      }
-
-      if (bestCandidate && bestScoreResult) {
-        const claimed = await this.stateManager.claimQueueTicket(bestCandidate.sessionId, mode);
-        if (claimed) {
+      // Score and sort all eligible candidates descending so we can skip stale ghost tickets cleanly
+      const scoredCandidates = candidates
+        .map((candidate) => {
           const candidateQueued: QueuedSession = {
-            sessionId: bestCandidate.sessionId,
-            visitorId: bestCandidate.visitorId,
-            profession: bestCandidate.profession || 'Undisclosed',
-            interests: bestCandidate.interests || [],
-            country: bestCandidate.country || 'GLOBAL',
-            mode: bestCandidate.sessionMode || 'video',
-            queuedAt: bestCandidate.timestamp || Date.now(),
-            blockedSessionIds: new Set(),
+            sessionId: candidate.sessionId,
+            visitorId: candidate.visitorId,
+            profession: candidate.profession || 'Undisclosed',
+            interests: candidate.interests || [],
+            country: candidate.country || 'GLOBAL',
+            mode: this.getQueueMode(candidate.sessionMode || mode),
+            queuedAt: candidate.timestamp || now,
+            blockedSessionIds: new Set(candidate.blockedSessionIds || []),
+            blockedVisitorIds: new Set(candidate.blockedVisitorIds || []),
             matchedSessionId: null,
           };
-          this.pairSessions(session, candidateQueued, bestScoreResult);
+          return {
+            candidate,
+            candidateQueued,
+            scoreResult: calculateCompatibility(queuedSession, candidateQueued),
+          };
+        })
+        .sort((a, b) => b.scoreResult.score - a.scoreResult.score);
+
+      for (const { candidate, candidateQueued, scoreResult } of scoredCandidates) {
+        if (session.currentMode !== 'matching') return false;
+
+        const claimed = await this.stateManager.claimQueueTicket(candidate.sessionId, mode);
+        if (!claimed) continue;
+
+        // Also remove our own ticket from Redis so no third instance claims us simultaneously
+        await this.stateManager.removeQueueTicket(session.sessionId, mode);
+
+        const paired = await this.pairSessionsAsync(session, candidateQueued, scoreResult);
+        if (paired) {
           return true;
         }
+
+        // Candidate was a stale ghost ticket (0 active Redis subscribers): re-register self and keep checking
+        console.warn(
+          `[OLOGLE Matchmaker] Skipped stale ghost ticket candidate=${candidate.sessionId.slice(0, 10)} (0 active subscribers)`
+        );
       }
     } catch (err: any) {
       console.warn('[OLOGLE Matchmaker] Shared queue matching error:', err.message);
+    } finally {
+      this.distributedMatchInFlight.delete(session.sessionId);
     }
     return false;
   }
@@ -1358,9 +1490,10 @@ export class OlogleEngine {
   private cancelMatching(session: EphemeralSession): void {
     if (session.currentMode === 'matching') {
       this.matchQueue.remove(session.sessionId);
-      this.stateManager.removeQueueTicket(session.sessionId, session.sessionMode || 'default');
+      void this.stateManager.removeQueueTicket(session.sessionId, this.getQueueMode(session.sessionMode));
       session.currentMode = 'none';
       this.syncSessionToRedis(session, 60);
+      console.log(`[OLOGLE Matchmaker] CANCEL_MATCHING session=${session.sessionId.slice(0, 10)}`);
       if (session.ws) {
         this.send(session.ws, PRE_SERIALIZED_MESSAGES.MATCHING_CANCELED);
       }
@@ -1368,13 +1501,21 @@ export class OlogleEngine {
   }
 
   private pairSessions(sessionA: EphemeralSession, candidateB: QueuedSession, scoreResult: MatchScoreResult): void {
+    void this.pairSessionsAsync(sessionA, candidateB, scoreResult);
+  }
+
+  private async pairSessionsAsync(
+    sessionA: EphemeralSession,
+    candidateB: QueuedSession,
+    scoreResult: MatchScoreResult
+  ): Promise<boolean> {
     const sessionB = this.sessions.get(candidateB.sessionId);
     const isRemoteB = !sessionB;
 
     if (isRemoteB) {
       if (!this.stateManager.isDistributed()) {
         this.matchQueue.remove(candidateB.sessionId);
-        return;
+        return false;
       }
     } else {
       // Local atomic verification to avoid race conditions
@@ -1389,12 +1530,13 @@ export class OlogleEngine {
           profession: sessionA.profession,
           interests: sessionA.interests,
           country: sessionA.country || 'GLOBAL',
+          mode: this.getQueueMode(sessionA.sessionMode),
           queuedAt: Date.now(),
           blockedSessionIds: sessionA.blockedSessionIds,
           matchedSessionId: null,
         };
         this.matchQueue.enqueue(queuedA);
-        return;
+        return false;
       }
     }
 
@@ -1412,12 +1554,52 @@ export class OlogleEngine {
       totalScore: scoreResult.score,
     };
 
+    const payloadA: ServerMessage = {
+      type: 'MATCH_FOUND',
+      roomId,
+      sharedInterests: scoreResult.sharedInterests,
+      sharedTopics: scoreResult.sharedTopics,
+      score: scoreResult.score,
+      partnerProfession: sessionB ? sessionB.profession : candidateB.profession,
+      partnerCountry: sessionB ? (sessionB.country || 'GLOBAL') : (candidateB.country || 'GLOBAL'),
+      partnerVisitorId: sessionB ? sessionB.visitorId : candidateB.visitorId,
+      scoreBreakdown,
+      isInitiator: true,
+    };
+
+    const payloadB: ServerMessage = {
+      type: 'MATCH_FOUND',
+      roomId,
+      sharedInterests: scoreResult.sharedInterests,
+      sharedTopics: scoreResult.sharedTopics,
+      score: scoreResult.score,
+      partnerProfession: sessionA.profession,
+      partnerCountry: sessionA.country || 'GLOBAL',
+      partnerVisitorId: sessionA.visitorId,
+      scoreBreakdown,
+      isInitiator: false,
+    };
+
+    // For cross-instance matches, verify remote delivery BEFORE finalizing sessionA's state
+    if (isRemoteB) {
+      const delivered = await this.stateManager.publishToSession(
+        candidateB.sessionId,
+        JSON.stringify({
+          ...payloadB,
+          partnerSessionId: sessionA.sessionId,
+        })
+      );
+      if (!delivered) {
+        return false;
+      }
+    }
+
     sessionA.currentMode = '1on1';
     sessionA.pairedSessionId = candidateB.sessionId;
     sessionA.currentRoomId = roomId;
-    sessionA.partnerProfession = sessionB ? sessionB.profession : candidateB.profession;
-    sessionA.partnerCountry = sessionB ? (sessionB.country || 'GLOBAL') : (candidateB.country || 'GLOBAL');
-    sessionA.partnerVisitorId = sessionB ? sessionB.visitorId : candidateB.visitorId;
+    sessionA.partnerProfession = payloadA.partnerProfession;
+    sessionA.partnerCountry = payloadA.partnerCountry;
+    sessionA.partnerVisitorId = payloadA.partnerVisitorId;
     sessionA.sharedInterests = scoreResult.sharedInterests;
     sessionA.sharedTopics = scoreResult.sharedTopics;
     sessionA.matchScore = scoreResult.score;
@@ -1446,45 +1628,20 @@ export class OlogleEngine {
       this.syncSessionToRedis(sessionB, 120);
     }
 
-    this.stateManager.removeQueueTicket(sessionA.sessionId, sessionA.sessionMode || 'default');
-    this.stateManager.removeQueueTicket(candidateB.sessionId, candidateB.mode || 'default');
-
-    const payloadA: ServerMessage = {
-      type: 'MATCH_FOUND',
-      roomId,
-      sharedInterests: scoreResult.sharedInterests,
-      sharedTopics: scoreResult.sharedTopics,
-      score: scoreResult.score,
-      partnerProfession: sessionA.partnerProfession,
-      partnerCountry: sessionA.partnerCountry,
-      partnerVisitorId: sessionA.partnerVisitorId,
-      scoreBreakdown,
-      isInitiator: true,
-    };
-
-    const payloadB: ServerMessage = {
-      type: 'MATCH_FOUND',
-      roomId,
-      sharedInterests: scoreResult.sharedInterests,
-      sharedTopics: scoreResult.sharedTopics,
-      score: scoreResult.score,
-      partnerProfession: sessionA.profession,
-      partnerCountry: sessionA.country || 'GLOBAL',
-      partnerVisitorId: sessionA.visitorId,
-      scoreBreakdown,
-      isInitiator: false,
-    };
+    const modeA = this.getQueueMode(sessionA.sessionMode);
+    const modeB = this.getQueueMode(candidateB.mode || sessionA.sessionMode);
+    void this.stateManager.removeQueueTicket(sessionA.sessionId, modeA);
+    void this.stateManager.removeQueueTicket(candidateB.sessionId, modeB);
 
     if (sessionA.ws) this.send(sessionA.ws, payloadA);
     if (sessionB && sessionB.ws) {
       this.send(sessionB.ws, payloadB);
-    } else {
-      // Include partnerSessionId only on internal cross-instance Redis relay; stripped before reaching client
-      this.sendToPartner(candidateB.sessionId, {
-        ...payloadB,
-        partnerSessionId: sessionA.sessionId,
-      });
     }
+
+    console.log(
+      `[OLOGLE Matchmaker] MATCH_FOUND room=${roomId} scope=${isRemoteB ? 'cross-instance' : 'local'} mode=${modeA} score=${scoreResult.score}`
+    );
+    return true;
   }
 
   private handlePadUpdate(session: EphemeralSession, content: string, language?: string): void {
@@ -1824,6 +1981,9 @@ export class OlogleEngine {
       }
     }
 
+    console.log(
+      `[OLOGLE WebRTC] Relay signal=${signal.type} room=${session.currentRoomId} from=${session.sessionId.slice(0, 10)}`
+    );
     this.sendToPartner(session.pairedSessionId, { type: 'WEBRTC_SIGNAL', signal });
   }
 
@@ -2359,6 +2519,11 @@ export class OlogleEngine {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
     }
+    if (this.distributedQueueSyncTimer) {
+      clearInterval(this.distributedQueueSyncTimer);
+      this.distributedQueueSyncTimer = null;
+    }
+    this.distributedMatchInFlight.clear();
     for (const timer of this.disconnectTimers.values()) {
       clearTimeout(timer);
     }

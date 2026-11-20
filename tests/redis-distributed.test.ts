@@ -25,7 +25,7 @@ class InMemoryRedisClusterBus {
   public createClients(): { pubClient: any; subClient: any } {
     const subRecord = {
       channels: new Set<string>(),
-      onMessage: (_ch: string, _msg: string) => {},
+      onMessage: (_ch: string, _msg: string) => { },
     };
     this.subscribers.add(subRecord);
 
@@ -142,7 +142,7 @@ describe('Redis & Distributed State Architecture (Fluid Compute & Cross-Instance
 
   describe('Production Non-Silent Fallback Verification', () => {
     it('loudly logs a CRITICAL alert in production when REDIS_URL is omitted rather than silently falling back', () => {
-      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
       const originalEnv = process.env.NODE_ENV;
       const originalRedisUrl = process.env.REDIS_URL;
 
@@ -415,6 +415,152 @@ describe('Redis & Distributed State Architecture (Fluid Compute & Cross-Instance
       expect(scrubbed).not.toContain('mySecretPass');
       expect(scrubbed).toContain('[REDACTED_REDIS_URL]');
       expect(scrubbed).toContain('password=[REDACTED]');
+    });
+
+    it('skips stale ghost queue tickets in Redis (0 subscribers) and pairs two independent live users across instances with full WebRTC + chat + rejoin', async () => {
+      const bus = new InMemoryRedisClusterBus();
+      const state1 = new DistributedStateManager(bus.createClients());
+      const state2 = new DistributedStateManager(bus.createClients());
+
+      // Seed a stale ghost ticket left behind by a crashed serverless instance (no active subscriber)
+      await state1.registerQueueTicket({
+        sessionId: 'hl_ghost_crashed_instance_001',
+        visitorId: 'ghost_visitor_001',
+        profession: 'Software Engineer',
+        interests: ['Artificial Intelligence', 'WebRTC', 'TypeScript'],
+        country: 'GLOBAL',
+        sessionMode: 'video',
+        timestamp: Date.now(),
+      });
+
+      const engine1 = new OlogleEngine(state1);
+      const engine2 = new OlogleEngine(state2);
+
+      const server1 = createServer(createOlogleApp());
+      const server2 = createServer(createOlogleApp());
+      attachWebSocketServer(server1, engine1);
+      attachWebSocketServer(server2, engine2);
+
+      let port1 = 0;
+      let port2 = 0;
+      await new Promise<void>((r) => server1.listen(0, '127.0.0.1', () => {
+        port1 = (server1.address() as any).port;
+        r();
+      }));
+      await new Promise<void>((r) => server2.listen(0, '127.0.0.1', () => {
+        port2 = (server2.address() as any).port;
+        r();
+      }));
+
+      try {
+        const wsA = new WebSocket(`ws://127.0.0.1:${port1}/ws`);
+        const wsB = new WebSocket(`ws://127.0.0.1:${port2}/ws`);
+        const msgsA: any[] = [];
+        const msgsB: any[] = [];
+        wsA.on('message', (d) => msgsA.push(JSON.parse(d.toString())));
+        wsB.on('message', (d) => msgsB.push(JSON.parse(d.toString())));
+
+        await new Promise<void>((resolve) => {
+          const check = setInterval(() => {
+            if (
+              msgsA.some((m) => m.type === 'SESSION_REGISTERED') &&
+              msgsB.some((m) => m.type === 'SESSION_REGISTERED')
+            ) {
+              clearInterval(check);
+              resolve();
+            }
+          }, 15);
+        });
+
+        // Both clients register session profile & simultaneously request matching (race condition test)
+        wsA.send(JSON.stringify({
+          type: 'REGISTER_SESSION',
+          visitorId: 'real_user_alpha',
+          profession: 'Software Engineer',
+          interests: ['Artificial Intelligence', 'WebRTC', 'TypeScript'],
+        }));
+        wsB.send(JSON.stringify({
+          type: 'REGISTER_SESSION',
+          visitorId: 'real_user_beta',
+          profession: 'Product Designer',
+          interests: ['Artificial Intelligence', 'WebRTC', 'TypeScript'],
+        }));
+
+        wsA.send(JSON.stringify({
+          type: 'START_MATCHING',
+          visitorId: 'real_user_alpha',
+          profession: 'Software Engineer',
+          interests: ['Artificial Intelligence', 'WebRTC', 'TypeScript'],
+          country: 'GLOBAL',
+          sessionMode: 'video',
+        }));
+        wsB.send(JSON.stringify({
+          type: 'START_MATCHING',
+          visitorId: 'real_user_beta',
+          profession: 'Product Designer',
+          interests: ['Artificial Intelligence', 'WebRTC', 'TypeScript'],
+          country: 'GLOBAL',
+          sessionMode: 'video',
+        }));
+
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Timed out waiting for cross-instance match')), 4000);
+          const check = setInterval(() => {
+            if (
+              msgsA.some((m) => m.type === 'MATCH_FOUND') &&
+              msgsB.some((m) => m.type === 'MATCH_FOUND')
+            ) {
+              clearInterval(check);
+              clearTimeout(timeout);
+              resolve();
+            }
+          }, 20);
+        });
+
+        const matchA = msgsA.find((m) => m.type === 'MATCH_FOUND');
+        const matchB = msgsB.find((m) => m.type === 'MATCH_FOUND');
+        expect(matchA.roomId).toBe(matchB.roomId);
+        // Must have skipped the ghost ticket and paired the two live users
+        expect(matchA.partnerVisitorId).toBe('real_user_beta');
+        expect(matchB.partnerVisitorId).toBe('real_user_alpha');
+
+        // Full WebRTC offer -> answer -> ICE candidate exchange
+        wsA.send(JSON.stringify({ type: 'WEBRTC_SIGNAL', roomId: matchA.roomId, signal: { type: 'offer', sdp: 'v=0-offer' } }));
+        wsB.send(JSON.stringify({ type: 'WEBRTC_SIGNAL', roomId: matchB.roomId, signal: { type: 'answer', sdp: 'v=0-answer' } }));
+        wsA.send(JSON.stringify({ type: 'WEBRTC_SIGNAL', roomId: matchA.roomId, signal: { type: 'candidate', candidate: { candidate: 'candidate:1' } } }));
+
+        // 1-on-1 text chat relay
+        wsA.send(JSON.stringify({ type: 'SEND_1ON1_MESSAGE', text: 'Hello from Alpha!' }));
+
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Timed out waiting for WebRTC & chat relay')), 3000);
+          const check = setInterval(() => {
+            const hasOffer = msgsB.some((m) => m.type === 'WEBRTC_SIGNAL' && m.signal?.type === 'offer');
+            const hasCandidate = msgsB.some((m) => m.type === 'WEBRTC_SIGNAL' && m.signal?.type === 'candidate');
+            const hasAnswer = msgsA.some((m) => m.type === 'WEBRTC_SIGNAL' && m.signal?.type === 'answer');
+            const hasChat = msgsB.some((m) => m.type === 'RECEIVE_1ON1_MESSAGE' && m.text === 'Hello from Alpha!');
+            if (hasOffer && hasCandidate && hasAnswer && hasChat) {
+              clearInterval(check);
+              clearTimeout(timeout);
+              resolve();
+            }
+          }, 20);
+        });
+
+        // Clean disconnect & verify queue has no stale tickets left behind
+        wsA.send(JSON.stringify({ type: 'END_CONVERSATION' }));
+        await new Promise((r) => setTimeout(r, 100));
+        const remainingTickets = await state1.getSharedQueueTickets('video');
+        expect(remainingTickets.length).toBe(0);
+
+        wsA.close();
+        wsB.close();
+      } finally {
+        engine1.broadcastShutdown('test_done');
+        engine2.broadcastShutdown('test_done');
+        await new Promise<void>((r) => server1.close(() => r()));
+        await new Promise<void>((r) => server2.close(() => r()));
+      }
     });
   });
 });

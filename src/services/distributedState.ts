@@ -374,20 +374,11 @@ export class DistributedStateManager {
     this.isConnected = Boolean(pubOk && subOk);
   }
 
-  private initRedis(url: string): void {
+  private attachClientLifecycleListeners(): void {
     const isProd = process.env.NODE_ENV === 'production';
     const diagSummary = `host=${this.normalizedConfig.hostMasked}:${this.normalizedConfig.port}, tls=${this.normalizedConfig.tlsEnabled}, upstash=${this.normalizedConfig.isUpstash}`;
-    try {
-      const clientOptions = this.createClientOptions();
 
-      // 1. Dedicated Command & Publisher Client
-      this.pubClient = new Redis(url, clientOptions);
-
-      // 2. Dedicated Pub/Sub Subscriber Client (Redis protocol requires dedicated connection)
-      this.subClient = new Redis(url, clientOptions);
-
-      this.bindSubscriberEvents();
-
+    if (this.pubClient) {
       this.pubClient.on('ready', () => {
         this.lastError = null;
         this.updateConnectionFlag();
@@ -401,7 +392,19 @@ export class DistributedStateManager {
       this.pubClient.on('end', () => {
         this.updateConnectionFlag();
       });
+      this.pubClient.on('error', (err: any) => {
+        const safeMsg = sanitizeRedisErrorMessage(err?.message);
+        const code = err?.code ? ` [code=${err.code}]` : '';
+        this.lastError = `publisher: ${safeMsg}${code}`;
+        if (isProd) {
+          console.error(`[OLOGLE State] CRITICAL: Redis publisher error in production (${diagSummary}): ${safeMsg}${code}`);
+        } else {
+          console.warn(`[OLOGLE State] Redis publisher error (${diagSummary}): ${safeMsg}${code}`);
+        }
+      });
+    }
 
+    if (this.subClient) {
       this.subClient.on('ready', () => {
         this.lastError = null;
         this.updateConnectionFlag();
@@ -419,18 +422,6 @@ export class DistributedStateManager {
       this.subClient.on('end', () => {
         this.updateConnectionFlag();
       });
-
-      this.pubClient.on('error', (err: any) => {
-        const safeMsg = sanitizeRedisErrorMessage(err?.message);
-        const code = err?.code ? ` [code=${err.code}]` : '';
-        this.lastError = `publisher: ${safeMsg}${code}`;
-        if (isProd) {
-          console.error(`[OLOGLE State] CRITICAL: Redis publisher error in production (${diagSummary}): ${safeMsg}${code}`);
-        } else {
-          console.warn(`[OLOGLE State] Redis publisher error (${diagSummary}): ${safeMsg}${code}`);
-        }
-      });
-
       this.subClient.on('error', (err: any) => {
         const safeMsg = sanitizeRedisErrorMessage(err?.message);
         const code = err?.code ? ` [code=${err.code}]` : '';
@@ -441,6 +432,23 @@ export class DistributedStateManager {
           console.warn(`[OLOGLE State] Redis subscriber error (${diagSummary}): ${safeMsg}${code}`);
         }
       });
+    }
+  }
+
+  private initRedis(url: string): void {
+    const isProd = process.env.NODE_ENV === 'production';
+    const diagSummary = `host=${this.normalizedConfig.hostMasked}:${this.normalizedConfig.port}, tls=${this.normalizedConfig.tlsEnabled}, upstash=${this.normalizedConfig.isUpstash}`;
+    try {
+      const clientOptions = this.createClientOptions();
+
+      // 1. Dedicated Command & Publisher Client
+      this.pubClient = new Redis(url, clientOptions);
+
+      // 2. Dedicated Pub/Sub Subscriber Client (Redis protocol requires dedicated connection)
+      this.subClient = new Redis(url, clientOptions);
+
+      this.bindSubscriberEvents();
+      this.attachClientLifecycleListeners();
 
       void this.ensureConnected(5000);
     } catch (e: any) {
@@ -524,6 +532,7 @@ export class DistributedStateManager {
             this.pubClient = new Redis(this.normalizedConfig.normalizedUrl!, clientOptions);
             this.subClient = new Redis(this.normalizedConfig.normalizedUrl!, clientOptions);
             this.bindSubscriberEvents();
+            this.attachClientLifecycleListeners();
           }
 
           await Promise.all([
@@ -581,10 +590,25 @@ export class DistributedStateManager {
     if (!this.isConnected && !(await this.isReadyOrReconnect())) return false;
     if (!this.pubClient) return false;
     try {
-      await this.pubClient.publish(`ologle:session:${sessionId}`, message);
-      return true;
-    } catch {
+      const receivers = await this.pubClient.publish(`ologle:session:${sessionId}`, message);
+      return Number(receivers) > 0;
+    } catch (err: any) {
+      console.warn('[OLOGLE State] Failed to publish to session channel:', sanitizeRedisErrorMessage(err?.message));
       return false;
+    }
+  }
+
+  public async ensureSessionSubscribed(sessionId: string): Promise<void> {
+    if (!this.subscriptions.has(sessionId)) return;
+    if (!this.isConnected && this.normalizedConfig.normalizedUrl) {
+      await this.isReadyOrReconnect();
+    }
+    if (this.isConnected && this.subClient) {
+      try {
+        await this.subClient.subscribe(`ologle:session:${sessionId}`);
+      } catch (err: any) {
+        console.warn('[OLOGLE State] Failed to ensure session subscription:', sanitizeRedisErrorMessage(err?.message));
+      }
     }
   }
 
