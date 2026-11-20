@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { WebSocket } from 'ws';
 
-import { OlogleEngine } from './serverCore.ts';
+import { OlogleEngine } from './src/signaling/serverCore.js';
 
 function createSocket(): { socket: WebSocket; messages: string[] } {
   const messages: string[] = [];

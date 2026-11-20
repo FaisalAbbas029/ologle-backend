@@ -9,9 +9,9 @@ import {
   PROFESSION_BONUS_WEIGHT,
   COMPLEMENTARY_PROFESSION_BONUS_WEIGHT,
   type QueuedSession,
-} from './matchmaker.ts';
-import { defaultSafetyAgent } from './safetyAgent.ts';
-import { validateProfession } from './src/validation/index.ts';
+} from './src/matchmaking/matchmaker.js';
+import { defaultSafetyAgent } from './src/services/safetyAgent.js';
+import { validateProfession } from './src/validation/index.js';
 
 function makeQueuedSession(overrides: Partial<QueuedSession> = {}): QueuedSession {
   return {

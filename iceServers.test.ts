@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { describe, expect, it } from 'vitest';
 
-import { createIceServerConfig } from './iceServers.ts';
+import { createIceServerConfig } from './src/services/iceServers.js';
 
 describe('ICE server configuration', () => {
   it('returns STUN servers and reports when TURN is not configured', () => {

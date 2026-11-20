@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { OlogleEngine } from '../src/signaling/serverCore.ts';
-import { createIceServerConfig } from '../src/services/iceServers.ts';
+import { OlogleEngine } from '../src/signaling/serverCore.js';
+import { createIceServerConfig } from '../src/services/iceServers.js';
 
 describe('WebRTC Advanced Signaling, Trickle ICE & Glare Prevention', () => {
   it('relays SDP offer, SDP answer, and trickle ICE candidates between paired peers', () => {
@@ -11,14 +11,14 @@ describe('WebRTC Advanced Signaling, Trickle ICE & Glare Prevention', () => {
     const socketA = {
       readyState: 1,
       send: (str: string) => sentA.push(JSON.parse(str)),
-      close: () => {},
-      removeAllListeners: () => {},
+      close: () => { },
+      removeAllListeners: () => { },
     };
     const socketB = {
       readyState: 1,
       send: (str: string) => sentB.push(JSON.parse(str)),
-      close: () => {},
-      removeAllListeners: () => {},
+      close: () => { },
+      removeAllListeners: () => { },
     };
 
     const sessionA = engine.registerSession(socketA as any, undefined, '10.0.0.1', 'webrtc-vis-a');
@@ -129,15 +129,15 @@ describe('WebRTC Advanced Signaling, Trickle ICE & Glare Prevention', () => {
     const sentB: any[] = [];
     const socketA = {
       readyState: 1,
-      send: () => {},
-      close: () => {},
-      removeAllListeners: () => {},
+      send: () => { },
+      close: () => { },
+      removeAllListeners: () => { },
     };
     const socketB = {
       readyState: 1,
       send: (str: string) => sentB.push(JSON.parse(str)),
-      close: () => {},
-      removeAllListeners: () => {},
+      close: () => { },
+      removeAllListeners: () => { },
     };
 
     const sessionA = engine.registerSession(socketA as any, undefined, '10.0.0.1', 'stale-a');

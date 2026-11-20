@@ -63,7 +63,7 @@ function getWebSocketServer(): WebSocketServer {
   return wss;
 }
 
-export default function handler(req: any, res: any) {
+export default async function handler(req: any, res: any) {
   // Normalize original request URL when routed through Vercel rewrites (preserving query parameters)
   const matchedPath = req.headers['x-matched-path'] as string | undefined;
   if (matchedPath && req.url?.startsWith('/api/index')) {
@@ -111,7 +111,11 @@ export default function handler(req: any, res: any) {
   if (req.method === 'GET' && (pathname === '/health' || pathname === '/api/health' || matchedPath === '/health' || matchedPath === '/api/health')) {
     const isProd = process.env.NODE_ENV === 'production';
     const redisConfigured = distributedState.isConfigured();
+    if (redisConfigured) {
+      await distributedState.ensureConnected(3500);
+    }
     const redisConnected = distributedState.isDistributed();
+    const diag = distributedState.getDiagnostics();
     const status = (isProd && !redisConnected) ? 'degraded' : 'ok';
 
     return sendJson(200, {
@@ -125,6 +129,12 @@ export default function handler(req: any, res: any) {
         configured: redisConfigured,
         connected: redisConnected,
         mode: redisConnected ? 'distributed' : (isProd ? 'degraded_in_memory' : 'in_memory'),
+        publisherStatus: diag.publisherStatus,
+        subscriberStatus: diag.subscriberStatus,
+        tlsEnabled: diag.tlsEnabled,
+        hostMasked: diag.hostMasked,
+        isUpstash: diag.isUpstash,
+        error: diag.configError || diag.lastError,
       },
     });
   }

@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createServer, Server as HttpServer } from 'http';
 import { WebSocket } from 'ws';
-import { createOlogleApp, attachWebSocketServer } from '../src/app.ts';
-import { OlogleEngine } from '../src/signaling/serverCore.ts';
-import { validateProfession, validateInterests } from '../src/validation/index.ts';
-import { defaultSafetyAgent } from '../src/services/safetyAgent.ts';
+import { createOlogleApp, attachWebSocketServer } from '../src/app.js';
+import { OlogleEngine } from '../src/signaling/serverCore.js';
+import { validateProfession, validateInterests } from '../src/validation/index.js';
+import { defaultSafetyAgent } from '../src/services/safetyAgent.js';
 
 describe('Security & Abuse Prevention Suite', () => {
   let server: HttpServer;

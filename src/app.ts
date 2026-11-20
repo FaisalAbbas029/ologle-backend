@@ -154,10 +154,14 @@ export function createOlogleApp(): Express {
   });
 
   // Health and Status Endpoints
-  const handleHealth = (_req: express.Request, res: express.Response) => {
+  const handleHealth = async (_req: express.Request, res: express.Response) => {
     const isProd = process.env.NODE_ENV === 'production';
     const redisConfigured = distributedState.isConfigured();
+    if (redisConfigured) {
+      await distributedState.ensureConnected(3500);
+    }
     const redisConnected = distributedState.isDistributed();
+    const diag = distributedState.getDiagnostics();
     const status = (isProd && !redisConnected) ? 'degraded' : 'ok';
 
     res.json({
@@ -171,6 +175,12 @@ export function createOlogleApp(): Express {
         configured: redisConfigured,
         connected: redisConnected,
         mode: redisConnected ? 'distributed' : (isProd ? 'degraded_in_memory' : 'in_memory'),
+        publisherStatus: diag.publisherStatus,
+        subscriberStatus: diag.subscriberStatus,
+        tlsEnabled: diag.tlsEnabled,
+        hostMasked: diag.hostMasked,
+        isUpstash: diag.isUpstash,
+        error: diag.configError || diag.lastError,
       },
     });
   };
@@ -405,4 +415,13 @@ export function attachWebSocketServer(server: HttpServer, engine = ologleEngine)
 
   return wss;
 }
+
+let defaultAppInstance: Express | null = null;
+export default function defaultAppHandler(req: express.Request, res: express.Response) {
+  if (!defaultAppInstance) {
+    defaultAppInstance = createOlogleApp();
+  }
+  return defaultAppInstance(req, res);
+}
+
 

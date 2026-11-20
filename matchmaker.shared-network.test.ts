@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { MatchmakerQueue, type QueuedSession } from './matchmaker.ts';
+import { MatchmakerQueue, type QueuedSession } from './src/matchmaking/matchmaker.js';
 
 function makeSession(sessionId: string, visitorId: string): QueuedSession {
   return {

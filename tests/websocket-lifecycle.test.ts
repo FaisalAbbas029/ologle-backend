@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { OlogleEngine } from '../src/signaling/serverCore.ts';
+import { OlogleEngine } from '../src/signaling/serverCore.js';
 
 describe('WebSocket Protocol & Lifecycle Resilience', () => {
   it('detects dead sockets and terminates them when pong is missing', () => {

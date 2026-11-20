@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createServer, Server as HttpServer } from 'http';
 import { WebSocket } from 'ws';
-import { createOlogleApp, attachWebSocketServer } from '../src/app.ts';
-import { OlogleEngine } from '../src/signaling/serverCore.ts';
+import { createOlogleApp, attachWebSocketServer } from '../src/app.js';
+import { OlogleEngine } from '../src/signaling/serverCore.js';
 
 describe('High-Concurrency WebSocket Scaling & Memory Benchmark', () => {
   let server: HttpServer;

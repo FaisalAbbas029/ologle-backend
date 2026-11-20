@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import handler from '../api/index.ts';
+import handler from '../api/index.js';
 import { EventEmitter } from 'events';
 
 // Lightweight mock for Node http.IncomingMessage and http.ServerResponse

@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { OlogleEngine } from '../src/signaling/serverCore.ts';
-import { createOlogleApp } from '../src/app.ts';
+import { OlogleEngine } from '../src/signaling/serverCore.js';
+import { createOlogleApp } from '../src/app.js';
 
 describe('Privacy-by-Design & Zero Disk Persistence Verification', () => {
   it('strictly prohibits disk write APIs (fs.writeFile, appendFile, createWriteStream) across src/', () => {

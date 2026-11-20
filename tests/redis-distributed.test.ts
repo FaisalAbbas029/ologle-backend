@@ -1,9 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createServer } from 'http';
 import { WebSocket } from 'ws';
-import { DistributedStateManager } from '../src/services/distributedState.ts';
-import { createOlogleApp, attachWebSocketServer } from '../src/app.ts';
-import { OlogleEngine } from '../src/signaling/serverCore.ts';
+import {
+  DistributedStateManager,
+  parseAndNormalizeRedisUrl,
+  sanitizeRedisErrorMessage,
+} from '../src/services/distributedState.js';
+import { createOlogleApp, attachWebSocketServer } from '../src/app.js';
+import { OlogleEngine } from '../src/signaling/serverCore.js';
 
 /**
  * Test-only in-memory multi-instance Redis protocol bus for deterministic
@@ -374,6 +378,43 @@ describe('Redis & Distributed State Architecture (Fluid Compute & Cross-Instance
         await new Promise<void>((r) => server1.close(() => r()));
         await new Promise<void>((r) => server2.close(() => r()));
       }
+    });
+
+    it('validates and normalizes Upstash Redis TCP URLs, enforces TLS, rejects REST URLs, and redacts secrets', () => {
+      // 1. Standard Upstash rediss:// URL with quotes
+      const validUpstash = parseAndNormalizeRedisUrl(
+        '"rediss://default:superSecretToken123@vital-flamingo-12345.upstash.io:6379"'
+      );
+      expect(validUpstash.configError).toBeNull();
+      expect(validUpstash.tlsEnabled).toBe(true);
+      expect(validUpstash.isUpstash).toBe(true);
+      expect(validUpstash.hasPassword).toBe(true);
+      expect(validUpstash.port).toBe(6379);
+      expect(validUpstash.hostMasked).toBe('vita***.upstash.io');
+      expect(validUpstash.hostMasked).not.toContain('superSecretToken123');
+
+      // 2. Upstash redis:// URL (missing TLS 's') auto-upgrades to rediss://
+      const upgradedUpstash = parseAndNormalizeRedisUrl(
+        'redis://default:superSecretToken123@vital-flamingo-12345.upstash.io:6379'
+      );
+      expect(upgradedUpstash.configError).toBeNull();
+      expect(upgradedUpstash.autoUpgradedTls).toBe(true);
+      expect(upgradedUpstash.tlsEnabled).toBe(true);
+      expect(upgradedUpstash.protocol).toBe('rediss:');
+      expect(upgradedUpstash.normalizedUrl?.startsWith('rediss://')).toBe(true);
+
+      // 3. Upstash REST https:// URL is rejected with clear guidance
+      const restUrl = parseAndNormalizeRedisUrl('https://vital-flamingo-12345.upstash.io');
+      expect(restUrl.normalizedUrl).toBeNull();
+      expect(restUrl.configError).toContain('HTTP/HTTPS REST endpoint');
+
+      // 4. Error sanitizer strips URLs and credentials
+      const scrubbed = sanitizeRedisErrorMessage(
+        'Failed connecting to rediss://default:mySecretPass@vital-flamingo.upstash.io:6379 with password=mySecretPass'
+      );
+      expect(scrubbed).not.toContain('mySecretPass');
+      expect(scrubbed).toContain('[REDACTED_REDIS_URL]');
+      expect(scrubbed).toContain('password=[REDACTED]');
     });
   });
 });

@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeAll, afterAll } from 'vitest';
 import { createServer, Server as HttpServer } from 'http';
 import { WebSocket } from 'ws';
-import { createOlogleApp, attachWebSocketServer } from '../src/app.ts';
+import { createOlogleApp, attachWebSocketServer } from '../src/app.js';
 
 describe('OLOGLE Backend Full Integration & E2E Signaling', () => {
   let server: HttpServer;
