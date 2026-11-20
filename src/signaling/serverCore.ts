@@ -12,12 +12,12 @@
 
 import crypto from 'crypto';
 import { WebSocket } from 'ws';
-import { defaultSafetyAgent, type SafetyClassificationResult } from '../services/safetyAgent.ts';
-import { MatchmakerQueue, calculateCompatibility } from '../matchmaking/matchmaker.ts';
-import type { QueuedSession, MatchScoreResult } from '../matchmaking/matchmaker.ts';
-import { validateProfession, validateInterests } from '../validation/index.ts';
-import type { ScoreBreakdown, EphemeralLiveTicket } from '../types/index.ts';
-import { distributedState, DistributedStateManager } from '../services/distributedState.ts';
+import { defaultSafetyAgent, type SafetyClassificationResult } from '../services/safetyAgent.js';
+import { MatchmakerQueue, calculateCompatibility } from '../matchmaking/matchmaker.js';
+import type { QueuedSession, MatchScoreResult } from '../matchmaking/matchmaker.js';
+import { validateProfession, validateInterests } from '../validation/index.js';
+import type { ScoreBreakdown, EphemeralLiveTicket } from '../types/index.js';
+import { distributedState, DistributedStateManager } from '../services/distributedState.js';
 
 /**
  * Transient volatile in-memory cache with automated TTL purge.

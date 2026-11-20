@@ -1,7 +1,7 @@
-import { createOlogleApp, isOriginAllowed } from '../src/app.ts';
+import { createOlogleApp, isOriginAllowed } from '../src/app.js';
 import { WebSocketServer, WebSocket } from 'ws';
-import { ologleEngine } from '../src/signaling/serverCore.ts';
-import { distributedState } from '../src/services/distributedState.ts';
+import { ologleEngine } from '../src/signaling/serverCore.js';
+import { distributedState } from '../src/services/distributedState.js';
 
 const app = createOlogleApp();
 

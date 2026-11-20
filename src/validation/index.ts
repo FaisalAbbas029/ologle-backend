@@ -2,7 +2,7 @@
  * OLOGLE Backend — Input Validation & Sanitization
  */
 
-import { RECOGNIZED_PROFESSIONS, OCCUPATIONAL_STEMS, NON_PROFESSION_WORDS } from '../data/professionsData.ts';
+import { RECOGNIZED_PROFESSIONS, OCCUPATIONAL_STEMS, NON_PROFESSION_WORDS } from '../data/professionsData.js';
 
 const LOWERCASE_PROFESSIONS_SET = new Set<string>(
   RECOGNIZED_PROFESSIONS.map((p) => p.toLowerCase().trim())

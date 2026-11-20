@@ -1,6 +1,6 @@
 import { createServer } from 'http';
-import { createOlogleApp, attachWebSocketServer } from './app.ts';
-import { ologleEngine } from './signaling/serverCore.ts';
+import { createOlogleApp, attachWebSocketServer } from './app.js';
+import { ologleEngine } from './signaling/serverCore.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 const app = createOlogleApp();

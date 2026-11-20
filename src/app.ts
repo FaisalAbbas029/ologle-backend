@@ -1,17 +1,17 @@
 import express, { Express } from 'express';
 import { Server as HttpServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { ologleEngine } from './signaling/serverCore.ts';
-import { createIceServerConfig } from './services/iceServers.ts';
-import { distributedState } from './services/distributedState.ts';
-import { sanitizeText } from './validation/index.ts';
+import { ologleEngine } from './signaling/serverCore.js';
+import { createIceServerConfig } from './services/iceServers.js';
+import { distributedState } from './services/distributedState.js';
+import { sanitizeText } from './validation/index.js';
 import {
   transcribeAudioWithGemini,
   translateTextWithGemini,
   autoDetectAndTranslateWithGemini,
   generateIcebreakerWithGemini,
   generateAIPracticeReply,
-} from './services/geminiService.ts';
+} from './services/geminiService.js';
 
 const allowedOrigins = new Set([
   'https://ologle-five.vercel.app',

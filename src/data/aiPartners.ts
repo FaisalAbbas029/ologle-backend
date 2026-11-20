@@ -1,4 +1,4 @@
-import type { AIPracticePartner } from '../types/index.ts';
+import type { AIPracticePartner } from '../types/index.js';
 
 export const AI_PRACTICE_PARTNERS: AIPracticePartner[] = [
   {

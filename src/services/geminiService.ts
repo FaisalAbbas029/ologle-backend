@@ -5,7 +5,7 @@
  */
 
 import { GoogleGenAI } from '@google/genai';
-import { AI_PRACTICE_PARTNERS } from '../data/aiPartners.ts';
+import { AI_PRACTICE_PARTNERS } from '../data/aiPartners.js';
 
 let aiInstance: GoogleGenAI | null = null;
 
