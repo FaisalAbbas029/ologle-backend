@@ -10,6 +10,7 @@ export interface QueuedSession {
   ipAddress?: string;
   isLoopback?: boolean;
   profession: string;
+  strictProfessionFilter?: boolean; // When true, ONLY match users with the exact same normalized profession
   interests: string[];
   country?: string; // 'GLOBAL' or country code/name
   mode?: string; // 'video' | 'audio' | 'text'
@@ -593,15 +594,39 @@ export class MatchmakerQueue {
         }
       }
 
+      // 4. Strict Profession Filter Check (Only applied when explicitly enabled by either user)
+      if (currentSession.strictProfessionFilter || candidateSession.strictProfessionFilter) {
+        const profA = normalizeProfession(currentSession.profession);
+        const profB = normalizeProfession(candidateSession.profession);
+        if (!profA || !profB || profA !== profB) {
+          continue;
+        }
+      }
+
       const scoreResult = calculateCompatibility(currentSession, candidateSession);
 
-      // Only match if there is a positive compatibility or if queue has active candidate
-      if (!bestResult || scoreResult.score > bestResult.score) {
+      // Progressive relaxation for small user pools:
+      // If either user has been in the queue for > 6 seconds, allow match even if interest overlap is low/0,
+      // providing an open discovery baseline affinity score.
+      const now = Date.now();
+      const waitTimeMs = Math.max(
+        currentSession.queuedAt ? now - currentSession.queuedAt : 0,
+        candidateSession.queuedAt ? now - candidateSession.queuedAt : 0
+      );
+
+      let effectiveScore = scoreResult.score;
+      if (effectiveScore === 0 && waitTimeMs >= 6000) {
+        effectiveScore = 60; // Open discovery baseline score
+        scoreResult.score = 60;
+      }
+
+      // Select candidate with the highest compatibility score
+      if (!bestResult || effectiveScore > bestResult.score) {
         bestMatch = candidateSession;
         bestResult = scoreResult;
 
         // If high affinity score threshold is already achieved (>140), short-circuit to preserve CPU
-        if (scoreResult.score >= 140) {
+        if (effectiveScore >= 140) {
           break;
         }
       }

@@ -64,6 +64,7 @@ export interface EphemeralSession {
   isLoopback: boolean;
   ws: WebSocket | null;
   profession: string;
+  strictProfessionFilter?: boolean;
   interests: string[];
   country?: string; // 'GLOBAL' or country code/name
   sessionMode?: string; // 'video' | 'audio' | 'text'
@@ -128,7 +129,7 @@ export interface ClassRoom {
 // Client -> Server Action Messages
 export type ClientMessage =
   | { type: 'REGISTER_SESSION'; visitorId?: string; blockedStrangers?: string[]; profession?: string; interests?: string[] }
-  | { type: 'START_MATCHING'; visitorId?: string; blockedStrangers?: string[]; profession: string; interests: string[]; country?: string; mode?: string; sessionMode?: string }
+  | { type: 'START_MATCHING'; visitorId?: string; blockedStrangers?: string[]; profession: string; strictProfessionFilter?: boolean; interests: string[]; country?: string; mode?: string; sessionMode?: string }
   | { type: 'CANCEL_MATCHING' }
   | { type: 'NEXT_PERSON' }
   | { type: 'END_CONVERSATION' }
@@ -472,8 +473,8 @@ export class OlogleEngine {
     if (this.distributedQueueSyncTimer) clearInterval(this.distributedQueueSyncTimer);
     this.distributedQueueSyncTimer = setInterval(() => {
       if (this.matchQueue.size() === 0) return;
-      if (!this.stateManager.isConfigured()) return;
 
+      // 1. First, evaluate local queue pairing for waiting sessions (supports progressive relaxation)
       for (const session of this.sessions.values()) {
         if (session.currentMode !== 'matching' || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
           continue;
@@ -485,6 +486,7 @@ export class OlogleEngine {
           ipAddress: session.ipAddress,
           isLoopback: session.isLoopback,
           profession: session.profession,
+          strictProfessionFilter: session.strictProfessionFilter,
           interests: session.interests,
           country: session.country || 'GLOBAL',
           mode: queueMode,
@@ -494,22 +496,32 @@ export class OlogleEngine {
           matchedSessionId: null,
         };
 
-        void this.stateManager.registerQueueTicket(
-          {
-            sessionId: session.sessionId,
-            visitorId: session.visitorId,
-            ipAddress: session.ipAddress,
-            profession: session.profession,
-            interests: session.interests,
-            country: session.country || 'GLOBAL',
-            sessionMode: queueMode,
-            timestamp: Date.now(),
-            blockedSessionIds: Array.from(session.blockedSessionIds),
-            blockedVisitorIds: Array.from(session.blockedVisitorIds),
-          },
-          60
-        );
-        void this.tryMatchFromSharedQueue(session, queuedSession);
+        const localMatch = this.matchQueue.findBestMatch(queuedSession);
+        if (localMatch) {
+          this.pairSessions(session, localMatch.matchedSession, localMatch.scoreResult);
+          continue;
+        }
+
+        // 2. Refresh registration in shared Redis queue and attempt cross-instance match
+        if (this.stateManager.isConfigured()) {
+          void this.stateManager.registerQueueTicket(
+            {
+              sessionId: session.sessionId,
+              visitorId: session.visitorId,
+              ipAddress: session.ipAddress,
+              profession: session.profession,
+              strictProfessionFilter: session.strictProfessionFilter,
+              interests: session.interests,
+              country: session.country || 'GLOBAL',
+              sessionMode: queueMode,
+              timestamp: Date.now(),
+              blockedSessionIds: Array.from(session.blockedSessionIds),
+              blockedVisitorIds: Array.from(session.blockedVisitorIds),
+            },
+            60
+          );
+          void this.tryMatchFromSharedQueue(session, queuedSession);
+        }
       }
     }, 2000);
     if (
@@ -1094,7 +1106,8 @@ export class OlogleEngine {
           msg.profession,
           msg.interests,
           msg.country,
-          msg.sessionMode || msg.mode
+          msg.sessionMode || msg.mode,
+          msg.strictProfessionFilter
         );
         break;
 
@@ -1241,7 +1254,8 @@ export class OlogleEngine {
     profession: string,
     interests: string[],
     country?: string,
-    mode?: string
+    mode?: string,
+    strictProfessionFilter?: boolean
   ): void {
     const banCheck = this.isBanned(session.visitorId, session.ipAddress);
     if (banCheck.banned) {
@@ -1262,6 +1276,7 @@ export class OlogleEngine {
     if (mode) {
       session.sessionMode = mode;
     }
+    session.strictProfessionFilter = Boolean(strictProfessionFilter);
 
     const profValidation = validateProfession(cleanProf);
     if (!profValidation.isValid) {
@@ -1303,6 +1318,7 @@ export class OlogleEngine {
       ipAddress: session.ipAddress,
       isLoopback: session.isLoopback,
       profession: session.profession,
+      strictProfessionFilter: session.strictProfessionFilter,
       interests: session.interests,
       country: session.country || 'GLOBAL',
       mode: queueMode,
@@ -1376,6 +1392,7 @@ export class OlogleEngine {
           visitorId: session.visitorId,
           ipAddress: session.ipAddress,
           profession: session.profession,
+          strictProfessionFilter: session.strictProfessionFilter,
           interests: session.interests,
           country: session.country || 'GLOBAL',
           sessionMode: queueMode,
@@ -1439,11 +1456,21 @@ export class OlogleEngine {
 
       // Score and sort all eligible candidates descending so we can skip stale ghost tickets cleanly
       const scoredCandidates = candidates
+        .filter((candidate) => {
+          // If strict profession filtering was requested by either user, enforce matching profession
+          if (queuedSession.strictProfessionFilter || candidate.strictProfessionFilter) {
+            const profA = (queuedSession.profession || '').toLowerCase().trim();
+            const profB = (candidate.profession || '').toLowerCase().trim();
+            if (profA !== profB) return false;
+          }
+          return true;
+        })
         .map((candidate) => {
           const candidateQueued: QueuedSession = {
             sessionId: candidate.sessionId,
             visitorId: candidate.visitorId,
             profession: candidate.profession || 'Undisclosed',
+            strictProfessionFilter: candidate.strictProfessionFilter,
             interests: candidate.interests || [],
             country: candidate.country || 'GLOBAL',
             mode: this.getQueueMode(candidate.sessionMode || mode),
@@ -1452,10 +1479,21 @@ export class OlogleEngine {
             blockedVisitorIds: new Set(candidate.blockedVisitorIds || []),
             matchedSessionId: null,
           };
+          const scoreResult = calculateCompatibility(queuedSession, candidateQueued);
+
+          // Progressive relaxation for small user pools:
+          const waitTimeMs = Math.max(
+            queuedSession.queuedAt ? now - queuedSession.queuedAt : 0,
+            candidateQueued.queuedAt ? now - candidateQueued.queuedAt : 0
+          );
+          if (scoreResult.score === 0 && waitTimeMs >= 6000) {
+            scoreResult.score = 60; // Open discovery baseline affinity score
+          }
+
           return {
             candidate,
             candidateQueued,
-            scoreResult: calculateCompatibility(queuedSession, candidateQueued),
+            scoreResult,
           };
         })
         .sort((a, b) => b.scoreResult.score - a.scoreResult.score);

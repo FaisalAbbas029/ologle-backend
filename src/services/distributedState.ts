@@ -43,6 +43,7 @@ export interface SharedQueueTicket {
   visitorId: string;
   ipAddress?: string;
   profession: string;
+  strictProfessionFilter?: boolean;
   interests: string[];
   country?: string;
   sessionMode?: string;
